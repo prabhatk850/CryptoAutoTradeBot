@@ -18,22 +18,17 @@ class Settings(BaseSettings):
     # stale levels; mark-price candles are smooth and match the real market.
     use_mark_candles: bool = True
     # Symbols the bot actively trades SIMULTANEOUSLY (each opens + manages its own).
-    # BTCUSD only while training on the testnet: its book is tight (~0.00% spread vs
-    # mark), so fills are realistic. ETHUSD's testnet book is frequently empty — bids
-    # have been seen at $20 against a $1,880 mark — which produces fake losses that
-    # teach the tuner nothing. Re-add symbols once their books are verified liquid.
-    trade_symbols: str = "BTCUSD"
+    trade_symbols: str = "BTCUSD,ETHUSD"
     max_concurrent_positions: int = 2  # cap total open positions across all coins
     trade_quantity: int = 1
     check_interval_minutes: int = 5
     # Minimum strategies that must agree (on the entry timeframe) to trade.
     min_signals: int = 2
-    # Multi-timeframe, shifted up one step: deciding on 15m with a 5-minute tick
-    # produced more noise than signal for stops that need room to breathe.
-    # 4h sets bias, 1h is the DECISION timeframe, 15m is timing only.
-    trend_timeframe: int = 240   # 4h — sets allowed direction (bias)
-    entry_timeframe: int = 60    # 1h — the timeframe trades are decided on
-    ltf_timeframe: int = 15      # 15m — lower timeframe analyzed for entry timing
+    # Multi-timeframe: 1h sets bias, 15m is the DECISION timeframe (votes + entry),
+    # 5m is analyzed for entry timing/confirmation only (never the decision TF).
+    trend_timeframe: int = 60    # 1h — sets allowed direction (bias)
+    entry_timeframe: int = 15    # 15m — the timeframe trades are decided on
+    ltf_timeframe: int = 5       # 5m — lower timeframe analyzed for entry timing
     # Auto-start the trading bot when the backend boots (survives restarts).
     auto_start_bot: bool = True
     # Comma-separated strategy ids to vote on each trade. Add new ones here.
@@ -54,10 +49,7 @@ class Settings(BaseSettings):
     risk_max_pct: float = 1.5
     margin_cap_pct: float = 0.5        # never use more than 50% of *available* balance as margin on ONE trade
     stop_loss_pct: float = 1.0         # fallback stop distance (%) if no SL candidate
-    # FLOOR reward:risk. Lowered from 2.0: with stops now sitting outside the noise,
-    # demanding 2R rejected almost every setup (874 skips in 30 days) and admitted
-    # only the tightest-stop trades — exactly the ones noise takes out.
-    risk_reward: float = 1.5
+    risk_reward: float = 2.0           # FLOOR reward:risk (never below 1:2)
     # --- Per-symbol POINT limits (ETH). Normal trades are tight; "big" trades widen SL/TP. ---
     eth_sl_min_pts: float = 5.0
     eth_sl_max_pts: float = 20.0       # normal ETH stop: at most 20 points
@@ -73,13 +65,9 @@ class Settings(BaseSettings):
     atr_period: int = 14
     atr_k: float = 1.5                 # ATR-based stop = entry +/- k*ATR
     sl_lookback: int = 20              # bars for structure swing (entry TF)
-    # Stop distance band. The floor was 0.3% (~$275 on BTC) — roughly one 15m candle's
-    # range, so trades were being stopped out by ordinary noise before the idea
-    # resolved (six live trades, six ~-1R stop-outs). 0.8% puts the stop outside that
-    # band; risk-based sizing shrinks the position to compensate, so $ risk is unchanged.
-    min_sl_pct: float = 0.8            # clamp stop distance to >= this % of price
-    max_sl_pct: float = 2.0            # clamp stop distance to <= this % of price
-    target_lookback: int = 30          # HTF bars used for the reward:risk feasibility check
+    min_sl_pct: float = 0.3            # clamp stop distance to >= this % of price
+    max_sl_pct: float = 1.5            # clamp stop distance to <= this % of price (no big stops)
+    target_lookback: int = 30          # 1h bars used for the 1:2 feasibility check
     # --- Partial take-profits + breakeven ---
     # Never more than 2 TPs. Set max_tps=1 for a single target (tp_splits="1.0").
     max_tps: int = 2
