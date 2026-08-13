@@ -1,0 +1,36 @@
+# Dev-mode overrides. Compose merges this into docker-compose.yml automatically,
+# so plain `docker compose up -d` picks it up — no extra flags needed.
+#
+# The base frontend image bakes a production build (`npm run build` + `npm start`),
+# which means every UI edit needs `--build`. Here we mount the source instead and
+# run `next dev`, so saving a file hot-reloads the browser.
+
+services:
+  # The Claude Code CLI is installed in the backend image, but its auth lives on YOUR
+  # machine. Mounting both files lets the container use your existing subscription —
+  # no API key. They're mounted read-write because the CLI refreshes its own token.
+  # (Machine-specific, which is why this lives in the override rather than the
+  # committed compose file.)
+  backend:
+    volumes:
+      - ./backend:/app
+      - ${USERPROFILE}/.claude:/root/.claude
+      - ${USERPROFILE}/.claude.json:/root/.claude.json
+    environment:
+      - CLAUDE_CLI_PATH=/usr/local/bin/claude
+
+  frontend:
+    command: npm run dev
+    volumes:
+      - ./frontend:/app
+      # Anonymous volumes keep the container's own copies: host node_modules were
+      # installed on Windows (wrong binaries for alpine), and .next must not be
+      # shared between the prod build and the dev server.
+      - /app/node_modules
+      - /app/.next
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      # Bind mounts on Windows don't deliver inotify events into the container,
+      # so the dev server has to poll to notice file changes.
+      - WATCHPACK_POLLING=true
+      - CHOKIDAR_USEPOLLING=true

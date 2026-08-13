@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "forexbot": {
+      "command": "c:\\Users\\cnd44\\Desktop\\bot\\forex-bot\\backend\\venv\\Scripts\\python.exe",
+      "args": [
+        "c:\\Users\\cnd44\\Desktop\\bot\\forex-bot\\mcp_server\\server.py"
+      ],
+      "env": {
+        "FOREXBOT_API_URL": "http://localhost:8000"
+      }
+    }
+  }
+}

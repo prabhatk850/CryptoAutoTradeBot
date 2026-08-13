@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  mongodb:
+    image: mongo:7
+    container_name: forex_mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: forexbot
+
+  backend:
+    build: ./backend
+    container_name: forex_backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mongodb
+    env_file:
+      - .env
+    # Mongo Atlas is reached over mongodb+srv, so every connection needs working
+    # SRV/A lookups. Docker's default forwarder (the host resolver) was dropping
+    # them intermittently — "Name or service not known" — which turned DB-backed
+    # endpoints into 5s timeouts and 500s. Pin public resolvers instead.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    volumes:
+      - ./backend:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  frontend:
+    build: ./frontend
+    container_name: forex_frontend
+    ports:
+      - "4000:4000"
+    depends_on:
+      - backend
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+
+volumes:
+  mongo_data:
