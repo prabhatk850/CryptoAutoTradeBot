@@ -12,7 +12,23 @@ powershell -ExecutionPolicy Bypass -File scripts\run_backend.ps1
 It restarts the backend automatically if it crashes. Logs → `scripts\backend.log`.
 Closing the window stops it. (Run `run_frontend.ps1` too if you want the dashboard up.)
 
-## Option B — Start automatically at login (recommended)
+## Option A2 — INSTALLED: 24/7 auto-start via Startup folder (no admin)
+This repo is already set up to run the agent 24/7. A launcher lives in your Startup folder:
+`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\CryptoAutoTradeBot.cmd`, which at
+every logon runs `scripts\agent_247.ps1` — a **port-aware watchdog** that keeps the backend
+(the agent loop) alive and restarts it if it ever dies. Logs → `logs\agent_247.log` and
+`logs\backend.out.log`. The agent loop resumes automatically (`AUTO_START_BOT=true`).
+
+- **Start it now (without waiting for a logon):**
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File scripts\agent_247.ps1
+  ```
+- **Remove 24/7 auto-start:** delete `CryptoAutoTradeBot.cmd` from the Startup folder above.
+
+## Option B — Start automatically at login via Task Scheduler (needs an elevated shell)
+`scripts\install_autostart.ps1` registers a Task Scheduler task (restart-on-failure). It
+requires a normal/elevated PowerShell — the sandboxed tooling can't register tasks. Prefer
+Option A2 above unless you specifically want Task Scheduler's restart semantics.
 Register a Task Scheduler task so it launches on every login and restarts on failure:
 
 ```powershell

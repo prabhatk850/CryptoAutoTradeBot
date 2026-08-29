@@ -79,6 +79,7 @@ export interface EmaSeries {
 interface Props {
   candles: Candle[];
   symbol: string;
+  livePrice?: number;   // real-time mark price → moves the forming candle like the exchange
   orders?: ChartOrder[];
   openEntry?: { side: string; avg: number; unrealized: number; sl?: number | null; tps?: number[] } | null;
   supertrend?: SuperTrendData | null;
@@ -213,7 +214,7 @@ function formatTick(t: number, tickMarkType: TickMarkType): string {
 }
 
 export default function TradingViewChart({
-  candles, symbol, orders = [], openEntry = null,
+  candles, symbol, livePrice = 0, orders = [], openEntry = null,
   supertrend = null, showSupertrend = false,
   trendline = null, showTrendline = false,
   fvg = null, showFvg = false,
@@ -250,6 +251,7 @@ export default function TradingViewChart({
   const toolRef = useRef(tool);
   const pointsRef = useRef<{ time: UTCTimestamp; value: number }[]>([]);
   const needsFitRef = useRef(true);
+  const liveBarRef = useRef<{ time: number; open: number; high: number; low: number; close: number } | null>(null);
 
   // ---- create chart ONCE (recreate only when symbol/timeframe/height change) ----
   useEffect(() => {
@@ -406,6 +408,35 @@ export default function TradingViewChart({
       chart.removeSeries(ema21Ref.current); ema21Ref.current = null;
     }
   }, [candles, showEma9, showEma21]);
+
+  // ---- REAL-TIME: move the forming candle with the live mark price (like Delta) ----
+  // Instead of rebuilding the whole array, we `update()` only the last bar every time a
+  // fresh price arrives (~1s). Accumulate high/low within the current time bucket; when
+  // the bucket rolls over, start a new forming candle. Runs after setData so a 30s
+  // historical refresh is immediately re-topped with the live bar (no flicker).
+  useEffect(() => {
+    const series = candleRef.current;
+    if (!series || !livePrice || livePrice <= 0 || candles.length === 0) return;
+    const num = (v: any) => (typeof v === "number" ? v : Number(v));
+    const last = candles[candles.length - 1];
+    const lastT = toSec(num(last.time));
+    const prevT = candles.length >= 2 ? toSec(num(candles[candles.length - 2].time)) : lastT - 60;
+    const step = Math.max(1, lastT - prevT);                       // candle width in seconds
+    const bucket = Math.max(lastT, Math.floor(Date.now() / 1000 / step) * step);
+
+    let bar = liveBarRef.current;
+    if (!bar || bar.time !== bucket) {
+      // new bucket → open a fresh candle; same bucket as the last historical → seed from it
+      bar = bucket > lastT
+        ? { time: bucket, open: livePrice, high: livePrice, low: livePrice, close: livePrice }
+        : { time: lastT, open: num(last.open), high: Math.max(num(last.high), livePrice),
+            low: Math.min(num(last.low), livePrice), close: livePrice };
+    } else {
+      bar = { ...bar, high: Math.max(bar.high, livePrice), low: Math.min(bar.low, livePrice), close: livePrice };
+    }
+    liveBarRef.current = bar;
+    try { series.update(bar as any); } catch { /* series not ready yet */ }
+  }, [livePrice, candles]);
 
   // ---- EMA 200 (server-computed over full history so it's warmed up) ----
   useEffect(() => {
