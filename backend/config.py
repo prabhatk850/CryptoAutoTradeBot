@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     max_concurrent_positions: int = 2  # cap total open positions across all coins
     trade_quantity: int = 1
     check_interval_minutes: int = 5
+    # Tick cadence in SECONDS. When > 0 this wins over check_interval_minutes, so the
+    # agent can run as often as every few seconds. NOTE: one tick makes several exchange
+    # calls per symbol; keep this comfortably above a single tick's runtime (and mind
+    # Delta rate limits) or ticks will coalesce/skip. 0 = fall back to minutes.
+    check_interval_seconds: int = 30
     # Minimum strategies that must agree (on the entry timeframe) to trade.
     min_signals: int = 2
     # Multi-timeframe: 1h sets bias, 15m is the DECISION timeframe (votes + entry),
@@ -82,6 +87,43 @@ class Settings(BaseSettings):
     weight_min: float = 0.3          # a strategy's vote can shrink to this
     weight_max: float = 2.0          # ...or grow to this
 
+    # --- Trading agents (book-derived) + meta-labeling learning ensemble ---------- #
+    # See .claude/skills/trading-books. The agents are the PRIMARY decision-maker; the
+    # LLM brain below runs only as a FALLBACK when the agents abstain. Each agent learns
+    # its own reliability from live trade outcomes (Beta posterior in Mongo `agent_perf`).
+    agents_enabled: bool = True
+    # Enabled agents (comma-separated ids). Options:
+    #   MOMENTUM, MEAN_REVERSION, SMC_AGENT, CONFLUENCE
+    agents: str = "MOMENTUM,MEAN_REVERSION,SMC_AGENT,CONFLUENCE"
+    # Meta-label take/skip threshold: the ensemble only trades when its predicted
+    # win-probability >= this. Below it, it abstains → the LLM fallback gets a turn.
+    agents_min_confidence: float = 0.55
+    # Pooled closed-trade count (across the winning agents) before half-Kelly sizing kicks in.
+    agents_min_trades: int = 12
+    agents_agreement_bonus: float = 0.03   # + per extra agreeing agent (capped by clamp)
+    agents_opposition_penalty: float = 0.10 # − scaled by opposing pooled mass / winning mass
+    # Position-size multiplier band applied to the trade's capital %. bet-size-from-prob
+    # (AFML) maps into [min, max]; half-Kelly can only pull it DOWN, never above max.
+    agents_size_min_mult: float = 0.5
+    agents_size_max_mult: float = 1.5
+    # Raw agent confidence band (before learning). Every agent maps its 0..1 signal
+    # strength into [min, max]; the learning layer then shifts it by reliability.
+    agent_conf_min: float = 0.55
+    agent_conf_max: float = 0.95
+    # Learning hyperparameters (symbol-agnostic).
+    agents_beta_prior: float = 1.0     # Beta(prior,prior) prior on each agent's win-rate (0.5 start)
+    agents_r_history: int = 50         # rolling R-multiples kept per agent for the Kelly estimate
+    # --- Mean-reversion agent (Chan Ch.2–5) ---
+    agent_hurst_mr_max: float = 0.5    # only fade when Hurst H < this (mean-reverting regime)
+    agent_mr_z_entry: float = 1.5      # |z-score| beyond which price is "stretched"
+    agent_mr_min_lookback: int = 10    # z-score window clamps (half-life sets it in between)
+    agent_mr_max_lookback: int = 60
+    # --- Momentum agent (Chan Ch.6–7) ---
+    agent_hurst_trend_min: float = 0.5 # only trend-follow when Hurst H >= this (or H unknown)
+    agent_mom_lookback: int = 20       # N-bar return + Donchian channel window
+    agent_mom_full_return: float = 0.02 # |N-bar return| that counts as full momentum strength
+    agent_mr_min_bars: int = 40        # min candles before the mean-reversion agent will act
+
     # --- AI brain: an LLM analyzes the chart each tick and sets entry/SL/TP ---
     # Trading provider priority: Gemini (GEMINI_API_KEY) → Anthropic API
     # (ANTHROPIC_API_KEY) → local Claude Code CLI → mechanical engine.
@@ -111,6 +153,11 @@ class Settings(BaseSettings):
     ai_mode: str = "decide"
     ai_min_confidence: float = 0.55     # below this the AI's trade is skipped (HOLD)
     ai_timeout_sec: int = 150           # max seconds to wait for a Claude response
+    # LLM fallback cooldown (seconds) PER SYMBOL. The agents decide every tick; the slow
+    # LLM fallback is consulted at most this often. Critical for sub-minute cadence: a
+    # single LLM call can take 15–150s, so calling it every 30s tick would overlap ticks
+    # and hammer rate-limited providers (the 429 storm). 0 = no cooldown (call every tick).
+    ai_min_interval_sec: int = 300
     # Leave blank to auto-discover the Claude Code binary; set to override.
     claude_cli_path: str = ""
     ai_respect_trend_filter: bool = True  # still block trades that fight the 1h trend

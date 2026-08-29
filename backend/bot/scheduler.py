@@ -9,6 +9,7 @@ On each tick:
 """
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -17,7 +18,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from bot.delta_client import DeltaClient
 from bot.indicators import compute_indicators
 from bot.lux_indicators import supertrend_ai, trendline_breakout_navigator, fair_value_gaps, inverse_fvg, _atr
-from bot import strategies, autotune, ai_brain, smc, edge as edge_mod, news
+from bot import strategies, autotune, ai_brain, smc, edge as edge_mod, news, agents as agents_mod, ensemble
 from config import settings
 from db import db
 
@@ -26,6 +27,7 @@ logger = logging.getLogger("bot.scheduler")
 scheduler = AsyncIOScheduler()
 _bot_running = False
 _delta = DeltaClient()
+_last_ai_call: dict[str, float] = {}  # symbol -> monotonic ts of last LLM fallback (cooldown)
 
 
 def _analyze(candles):
@@ -355,7 +357,12 @@ async def _manage_open_position(symbol: str):
                     R = (realized / risk_d) if risk_d > 0 else (1.0 if realized > 0 else -1.0 if realized < 0 else 0.0)
                     action = "BUY" if state.get("side") == "buy" else "SELL"
                     await autotune.record_outcome(state.get("votes") or {}, action, R)
-                    logger.info(f"{symbol} closed — realized ${realized:.2f} ({R:+.2f}R) → attributed to {action} voters")
+                    # continuous learning: credit/debit the agents that drove this trade
+                    agent_ids = state.get("agents") or []
+                    if agent_ids:
+                        await ensemble.record_outcome(agent_ids, R)
+                    logger.info(f"{symbol} closed — realized ${realized:.2f} ({R:+.2f}R) → "
+                                f"attributed to {action} voters" + (f" + agents {agent_ids}" if agent_ids else ""))
                 except Exception as e:
                     logger.error(f"attribution error: {e}")
                 for o in await _delta.get_live_orders(symbol):
@@ -428,12 +435,53 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
         else:
             reason = f"1h trend {bias_txt} | {result['reason']}"
 
-        # 3c. AI brain — Claude analyzes the full chart and (in 'decide' mode) makes the
-        # final call + structure-based SL/TP. Falls back to the mechanical result above
-        # if the AI is unavailable, times out, or returns nothing.
+        # 3c. AGENTS — the PRIMARY decision-maker. Book-derived trading agents each
+        # propose a side; the learning ensemble weights them by their LIVE win-rate,
+        # decides take/skip (meta-labeling) and the position-size multiplier. This is
+        # what makes the bot improve from its own trades. The LLM brain (3d) runs ONLY
+        # as a fallback when the agents abstain.
+        agent_drove = False
+        agent_size_mult = 1.0
+        agent_sl_hint = None
+        agent_ids: list[str] = []
+        ens = None
+        try:
+            agent_ctx = agents_mod.AgentContext(
+                symbol=symbol, price=ind["close"], c_entry=c_entry, c_trend=c_trend,
+                ind=ind, supertrend=st, trendline=tn, fvg=fvg, ifvg=ifvg,
+                smc=smc_e, smc_trend=smc_t, bias=bias, confluence=result)
+            ens = await ensemble.decide(agent_ctx)
+        except Exception as e:
+            logger.error(f"[{symbol}] agent ensemble failed: {e}")
+        if ens and ens["action"] in ("BUY", "SELL"):
+            cand = ens["action"]
+            if settings.ai_respect_trend_filter and (
+                (cand == "BUY" and bias < 0) or (cand == "SELL" and bias > 0)
+            ):
+                action = "HOLD"
+                reason = f"Agents wanted {cand} but blocked by 1h {bias_txt} trend | {ens['reason']}"
+            else:
+                action = cand
+                agent_drove = True
+                agent_size_mult = ens["size_mult"]
+                agent_sl_hint = ens["sl_hint"]
+                agent_ids = ens["agents"]
+                reason = f"{ens['reason']} · 1h {bias_txt}"
+
+        # 3d. AI brain (FALLBACK ONLY) — runs when the agents abstained. In 'decide'
+        # mode it makes the call + structure SL/TP; otherwise it refines SL/TP. Falls
+        # back to the mechanical result above if unavailable/timed out.
+        # COOLDOWN: an LLM call can take 15–150s, so at a fast tick cadence we must NOT
+        # call it every tick (that overlaps ticks and triggers provider rate-limit storms).
+        # Consult it at most once per ai_min_interval_sec PER SYMBOL; agents cover the rest.
         ai_plan = None
         ai_drove = False
-        if ai_brain.available() and settings.ai_mode in ("decide", "refine", "advisory"):
+        _now = time.monotonic()
+        _ai_cooldown_ok = (settings.ai_min_interval_sec <= 0 or
+                           _now - _last_ai_call.get(symbol, 0.0) >= settings.ai_min_interval_sec)
+        if not agent_drove and _ai_cooldown_ok and ai_brain.available() \
+                and settings.ai_mode in ("decide", "refine", "advisory"):
+            _last_ai_call[symbol] = _now
             try:
                 hist_edge = await edge_mod.get_edge(symbol)  # backtested per-strategy edge (cached ~6h)
                 news_ctx = await news.ai_context(symbol)     # cached: upcoming events + latest headlines
@@ -470,7 +518,12 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                     "invalidation": ai_plan["invalidation"], "proposed_action": ai_plan["action"],
                     "stop_loss": ai_plan["stop_loss"], "take_profits": ai_plan["take_profits"],
                     "drove": ai_drove} if ai_plan else None)
+        agent_meta = ({"decision": ens["action"], "confidence": ens["confidence"],
+                       "size_mult": ens["size_mult"], "agents": ens["agents"],
+                       "proposals": ens["proposals"], "reason": ens["reason"],
+                       "drove": agent_drove} if ens else None)
         logger.info(f"[{symbol}] {action} (1h bias={bias_txt}, votes={result['votes']}, "
+                    f"agents={'drove' if agent_drove else (ens['action'] if ens else 'off')}, "
                     f"ai={'on' if ai_plan else 'off'}{f' {ai_plan['confidence']:.0%}' if ai_plan else ''})")
 
         # 4. Execute (position-aware: no pyramiding; bracketed entry from flat)
@@ -540,10 +593,16 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                         clamped = _clamp_sl(want_long, price, ai_plan.get("stop_loss"))
                         if clamped is not None:
                             sl_price, sl_method = clamped, "ai"
+                    elif agent_drove and agent_sl_hint is not None:
+                        clamped = _clamp_sl(want_long, price, agent_sl_hint)
+                        if clamped is not None:
+                            sl_price, sl_method = clamped, "agent"
                     if sl_price is None:
                         sl_price, _sl_cands, sl_method = _combined_sl(want_long, price, c_entry, st)
                         if ai_drove:
                             sl_method += "+ai-fallback"
+                        elif agent_drove:
+                            sl_method += "+agent-fallback"
 
                     # Per-symbol POINT limits (ETH): cap the stop distance (tight for normal,
                     # wider for big trades). Keeps the structure stop if it's already tighter.
@@ -571,8 +630,12 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                         await _delta.set_leverage(symbol, lev)
 
                         # CAPITAL-BASED sizing: deploy a fixed % of balance as margin
-                        # (50% normal, less for big trades -> smaller lots).
+                        # (50% normal, less for big trades -> smaller lots). When agents
+                        # drove the call, scale by the ensemble's Kelly/probability size
+                        # multiplier (AFML bet sizing) — conviction trades get more capital.
                         cap_pct = settings.big_trade_capital_pct if big else settings.position_capital_pct
+                        if agent_drove:
+                            cap_pct *= agent_size_mult
                         margin_usd = total_bal * cap_pct / 100.0
                         # respect the available-balance ceiling
                         margin_usd = min(margin_usd, avail * settings.margin_cap_pct)
@@ -645,7 +708,7 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                             {"_id": symbol, "side": side, "size": lots, "entry": entry_ref,
                              "fill_price": fill_price,
                              "sl": sl_price, "tps": placed_tps, "rr": rr, "be_moved": False,
-                             "votes": result["votes"], "risk_dollars": round(risk_dollars, 4),
+                             "votes": result["votes"], "agents": agent_ids, "risk_dollars": round(risk_dollars, 4),
                              "sl_method": sl_method, "tp_source": tp_source, "ai": ai_meta,
                              "leverage": lev, "big_trade": big, "capital_pct": cap_pct,
                              "opened_at": datetime.now(timezone.utc)},
@@ -707,6 +770,7 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                        "stop_loss": round(sl_price, 2) if sl_price else None,
                        "take_profit": round(tp_price, 2) if tp_price else None},
             "ai": ai_meta,
+            "agents": agent_meta,
             "order_id": order_id,
             "order_status": order_status,
             "paper_trade": True,
@@ -749,18 +813,26 @@ def start_bot():
     global _bot_running
     if _bot_running:
         return {"status": "already_running"}
+    secs = settings.check_interval_seconds if settings.check_interval_seconds > 0 \
+        else settings.check_interval_minutes * 60
     scheduler.add_job(
         bot_tick,
-        trigger=IntervalTrigger(minutes=settings.check_interval_minutes),
+        trigger=IntervalTrigger(seconds=secs),
         id="bot_tick",
         replace_existing=True,
         next_run_time=datetime.now(timezone.utc),  # run immediately on start
+        # A tick makes several exchange calls and can outlast a short interval. Never let
+        # ticks overlap or pile up: run at most one at a time, and if several are due, run
+        # just the latest. This keeps a 30s cadence safe even when a tick runs long.
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=max(10, secs),
     )
     # Start the scheduler only once; subsequent start/stop just add/remove the job.
     if not scheduler.running:
         scheduler.start()
     _bot_running = True
-    logger.info(f"Bot started — checking every {settings.check_interval_minutes} minutes.")
+    logger.info(f"Bot started — checking every {secs}s.")
     return {"status": "started"}
 
 
@@ -790,6 +862,8 @@ def bot_status() -> dict:
     return {
         "running": _bot_running,
         "interval_minutes": settings.check_interval_minutes,
+        "interval_seconds": (settings.check_interval_seconds if settings.check_interval_seconds > 0
+                             else settings.check_interval_minutes * 60),
         "symbol": settings.trading_symbol,
         "symbols": syms,
         "next_run": (
