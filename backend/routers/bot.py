@@ -70,13 +70,22 @@ def _skip_bucket(status: str) -> str:
 
 
 @router.get("/training")
-async def training(days: int = 30, limit: int = 25):
+async def training(days: int = 30, limit: int = 60):
     """Everything needed to judge whether the bot is LEARNING correctly.
 
     Separates the two things that used to be conflated:
       • strategy P/L — mark→mark, the quality of the DECISION (this trains the tuner)
       • execution P/L — real fills, the quality of the VENUE (never trains anything)
     Plus why entries were skipped, so the guard rails are visible rather than silent.
+
+    Two different scopes on purpose:
+      • recent_trades / summary — the last `limit` verified outcomes, whenever they
+        happened. A recency list, NOT windowed, so the panel still says something
+        useful during a quiet stretch.
+      • skipped — strictly the last `days` days, because a guard-rail count is only
+        meaningful against a period.
+    `latest_closed_at` / `stale_days` exist so the first scope cannot silently go
+    stale: writer outages show up as an age, instead of month-old numbers that look live.
     """
     since = datetime.now(timezone.utc) - timedelta(days=days)
 
@@ -118,6 +127,16 @@ async def training(days: int = 30, limit: int = 25):
                 o[k] = o[k].isoformat()
 
     n = len(outcomes)
+    latest_closed = outcomes[0].get("closed_at") if outcomes else None
+    stale_days = None
+    if latest_closed:
+        try:
+            ts = datetime.fromisoformat(str(latest_closed))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            stale_days = round((datetime.now(timezone.utc) - ts).total_seconds() / 86400, 1)
+        except Exception:
+            stale_days = None
     strat_total = round(sum(float(o.get("strategy_pnl") or 0) for o in outcomes), 2)
     exec_total = round(sum(float(o.get("execution_pnl") or 0) for o in outcomes), 2)
     strat_wins = sum(1 for o in outcomes if float(o.get("strategy_pnl") or 0) > 0)
@@ -138,6 +157,8 @@ async def training(days: int = 30, limit: int = 25):
             "slippage_cost": round(exec_total - strat_total, 2),
             "strategy_win_rate": round(strat_wins / n * 100, 1) if n else 0,
             "unverified_excluded": unverified,
+            "latest_closed_at": latest_closed,
+            "stale_days": stale_days,
         },
         "strategies": perf["strategies"],
         "recent_trades": outcomes,

@@ -22,6 +22,26 @@ class Settings(BaseSettings):
     max_concurrent_positions: int = 2  # cap total open positions across all coins
     trade_quantity: int = 1
     check_interval_minutes: int = 5
+    # Deep-analysis cadence. When > 0 this WINS over check_interval_minutes.
+    # 120s matches how long a full 2-symbol Ox Alpha tick actually takes, so the
+    # scheduler stops firing ticks that only get dropped as overlapping.
+    check_interval_seconds: int = 120
+
+    # --- Fast execution loop -------------------------------------------------- #
+    # The deep loop decides WHAT to trade; this loop decides WHEN, so a setup that
+    # ripens between deep ticks is not entered (or exited) up to 2 minutes late.
+    # It runs only for symbols the deep tick ARMED, uses FAST_PROVIDERS (Groq /
+    # Gemini — never Ox Alpha, never the subscription), and never analyses from
+    # scratch: it re-checks the armed trigger against a live price.
+    fast_check_enabled: bool = True
+    fast_check_seconds: int = 15
+    # Arm when the distance from price to the trigger is within this multiple of
+    # the move the market is expected to make before the next deep tick (derived
+    # from 5m ATR). 1.0 = "reachable at current volatility"; raise to arm sooner.
+    fast_arm_atr_mult: float = 1.2
+    # An armed watch expires after this many seconds if the deep loop never renews
+    # it, so a stale trigger can never fire on old analysis.
+    fast_arm_ttl_sec: int = 300
     # Minimum strategies that must agree (on the entry timeframe) to trade.
     min_signals: int = 2
     # Multi-timeframe: 1h sets bias, 15m is the DECISION timeframe (votes + entry),
@@ -87,6 +107,27 @@ class Settings(BaseSettings):
     # (ANTHROPIC_API_KEY) → local Claude Code CLI → mechanical engine.
     # The news brief is Claude-only (Anthropic API → CLI) — see news.get_brief().
     # Groq was removed deliberately; leftover GROQ_* env vars are ignored.
+    # --- OpenRouter / Ox Alpha: FIRST rung for all AI work ------------------- #
+    # oxalpha.site is only a tracker page; the model itself is served by OpenRouter
+    # as `stealth/ox-alpha` — free ($0 in/out), 1M context, OpenAI-compatible.
+    # It is a STEALTH model: the provider is anonymous, there is no SLA, and it can
+    # be withdrawn without notice — hence it leads a chain rather than replacing it.
+    openrouter_api_key: str = ""
+    openrouter_model: str = "stealth/ox-alpha"
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_max_output_tokens: int = 4096
+    # Sent as OpenRouter attribution headers (optional, but good manners).
+    openrouter_referer: str = "https://github.com/local/forex-bot"
+    openrouter_title: str = "forex-bot"
+
+    # --- Groq: SECOND rung. Fastest and cheapest, so it absorbs the routine
+    # 5-minute ticks before anything metered or subscription-backed is touched.
+    # NOTE: llama-3.3-70b-versatile was decommissioned by Groq (404) — that is why
+    # this provider went dark. Use a model that is live on the account.
+    groq_api_key: str = ""
+    groq_model: str = "openai/gpt-oss-120b"
+    groq_base_url: str = "https://api.groq.com/openai/v1"
+    groq_max_output_tokens: int = 4096
     gemini_api_key: str = ""
     # Two-tier Gemini. FLASH runs the 5-minute trading loop (288 calls/day — Pro there
     # would be slow and expensive). PRO runs the news brief, which is manual and
@@ -103,6 +144,34 @@ class Settings(BaseSettings):
     # cap must leave room for the answer ON TOP of the budget.
     gemini_max_output_tokens: int = 4096
     anthropic_api_key: str = ""
+    # --- AgentRouter (Claude reseller, https://agentrouter.org) --------------- #
+    # Anthropic-compatible, but it authenticates ONLY Claude-Code-style clients:
+    # the Python SDK is rejected with `unauthorized_client_error`, so this is
+    # reachable exclusively through the CLI path. ai_brain injects these into the
+    # `claude -p` subprocess, which keeps them out of interactive Claude Code
+    # sessions — those stay on the subscription and act as the final fallback.
+    agentrouter_api_key: str = ""
+    agentrouter_base_url: str = "https://agentrouter.org"
+    # This token can only reach claude-opus-5 and claude-opus-4-8.
+    agentrouter_model: str = "claude-opus-4-8"
+    # Spend guard. A headless CLI call costs ~$0.28, so on a 30-SECOND loop
+    # (2,880 ticks/day) an outage of the free rungs would burn ~$800/day and empty
+    # the balance in minutes. Once this many router calls have been made in a UTC
+    # day the rung is skipped and the chain moves on. 0 disables the cap.
+    agentrouter_daily_call_cap: int = 120
+    # Hard switch for the LAST rung. The Docker override mounts ~/.claude into the
+    # container, so the `cli` provider spends the personal Claude subscription.
+    # Set false to make the bot fail over to the mechanical engine instead of ever
+    # touching it — the chain then ends at AgentRouter.
+    # OFF by default: the trading bot runs only on user-supplied keys. No chain in
+    # ai_brain routes to `cli`, and this is the belt that keeps it that way even if
+    # one is added back by accident.
+    ai_allow_subscription_cli: bool = False
+    # Second belt on the same rung. Ox Alpha's daily ceiling is undocumented, so if
+    # it 429s mid-day a 30s loop (5,760 calls/day across 2 symbols) could pour
+    # thousands of calls into the personal subscription. Stop at this many per UTC
+    # day and fall to the mechanical engine instead. 0 disables the cap.
+    subscription_cli_daily_call_cap: int = 200
     ai_enabled: bool = True
     ai_model: str = "claude-sonnet-5"   # claude-sonnet-5 / claude-sonnet-5-6 / claude-haiku-5-20251001
     # decide  = AI picks direction + SL + TP (guardrails enforce risk); this is the default
