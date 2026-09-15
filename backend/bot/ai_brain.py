@@ -151,7 +151,8 @@ def build_snapshot(symbol, price, c_entry, c_trend, ind, st, tn, fvg, ifvg,
                    ind_t, st_t, tn_t, bias_txt, votes, weights, account,
                    smc_entry=None, smc_trend=None,
                    c_ltf=None, ind_l=None, st_l=None, tn_l=None, smc_ltf=None,
-                   historical_edge=None, news=None) -> dict:
+                   historical_edge=None, news=None,
+                   divergence=None, funding=None, orderbook=None) -> dict:
     """Assemble everything the model needs to reason about the trade, including the
     deterministic Smart Money Concepts read for each timeframe (1h bias, 15m decision,
     5m timing)."""
@@ -170,6 +171,11 @@ def build_snapshot(symbol, price, c_entry, c_trend, ind, st, tn, fvg, ifvg,
             "trendline": (tn_.get("latest") if tn_ else None),
             "recent_swing_highs": _swings(candles, True)[-6:],
             "recent_swing_lows": _swings(candles, False)[-6:],
+            "bb": {"mid": _r(ind_.get("bb_mid")), "upper": _r(ind_.get("bb_upper")), "lower": _r(ind_.get("bb_lower"))},
+            "kc": {"mid": _r(ind_.get("kc_mid")), "upper": _r(ind_.get("kc_upper")), "lower": _r(ind_.get("kc_lower"))},
+            "squeeze": ind_.get("squeeze_signal"),
+            "adx": _r(ind_.get("adx"), 1),
+            "vwap": _r(ind_.get("vwap")),
         }
 
     snap = {
@@ -185,6 +191,7 @@ def build_snapshot(symbol, price, c_entry, c_trend, ind, st, tn, fvg, ifvg,
             "fvg_zones_near": _near_zones((fvg or {}).get("unmitigated"), price),
             "ifvg_zones_near": _near_zones((ifvg or {}).get("zones"), price),
             "smc": smc_entry,
+            "divergence": (divergence or {}).get("latest"),
         },
         "trend_tf": {**tf_block(c_trend, ind_t, st_t, tn_t), "smc": smc_trend},
         "strategy_votes": votes,
@@ -206,6 +213,12 @@ def build_snapshot(symbol, price, c_entry, c_trend, ind, st, tn, fvg, ifvg,
     # Real-time news + upcoming high-impact economic events (see `news` guidance in system prompt).
     if news:
         snap["news"] = news
+    # Crypto-native confluence, both optional (see `funding`/`orderbook` guidance in
+    # system prompt): perpetual funding-rate bias, and short-horizon L2 book skew.
+    if funding:
+        snap["funding"] = funding
+    if orderbook:
+        snap["orderbook"] = orderbook
     return snap
 
 
@@ -262,6 +275,21 @@ tone; `headline_tone` is the net read. If a High-impact release for a relevant c
 cleaner setup and a tighter structural stop. Let `headline_tone` GENTLY tilt conviction, but never let a \
 headline override a clean SMC read or invent a trade the structure doesn't support.
 - If there is no clean SMC setup with a reachable 2R to real liquidity, return HOLD. Be selective — no forced trades.
+- Each timeframe also carries `bb`/`kc`/`squeeze` (Bollinger/Keltner squeeze state — "SQUEEZE_ON" means volatility \
+is compressed and building, "RELEASE_UP"/"RELEASE_DOWN" means it just let go in that direction), `adx` (trend \
+strength, 0-100), and `vwap` (session volume-weighted average price, when available). Treat `adx` on trend_tf \
+below ~20 as a warning that the 1h market is ranging — trend-following reads (EMA, SuperTrend, trendline) are \
+less reliable there, so demand a cleaner SMC setup before trusting a breakout. A squeeze release in your \
+direction is supportive confluence, never a standalone reason to trade.
+- `entry_tf.divergence`, when present, is the latest RSI/price divergence at a swing point ("regular" = reversal, \
+"hidden" = trend continuation). Treat it as one more piece of confluence for or against the setup — not an \
+override of the SMC read.
+- An optional `funding` block (perpetual funding rate + open interest) may be present: `extreme` is "high" \
+(crowded longs paying heavily — mild contrarian lean against more upside), "low" (crowded shorts — mild \
+contrarian lean against more downside), or null (not extreme / not enough history). Let it gently tilt \
+conviction at most — never let it override a clean SMC setup or invent a trade the structure doesn't support.
+- An optional `orderbook` block (top-of-book bid/ask volume imbalance) may be present: it is a SECONDS-scale \
+signal, useful only the way `timing_tf` is — to sharpen entry timing — never to override the 15m decision.
 
 Respond with ONLY minified JSON (no markdown, no prose) matching exactly:
 {"action":"BUY|SELL|HOLD","confidence":0.0-1.0,"entry":<number>,"stop_loss":<number>,\
@@ -579,8 +607,18 @@ def _call_claude(prompt: str, via_router: bool = False) -> Optional[str]:
         logger.error(f"Claude CLI [{label}] invocation error: {e}")
         return None
     if proc.returncode != 0:
-        logger.error(f"Claude CLI [{label}] exit {proc.returncode}: "
-                     f"{proc.stderr.decode('utf-8', 'ignore')[:300]}")
+        detail = proc.stderr.decode("utf-8", "ignore")[:300]
+        # stderr is often just a benign CLI warning (e.g. "connectors disabled")
+        # unrelated to the real failure — the actual reason usually lands in the
+        # JSON envelope on stdout instead (e.g. {"is_error":true,"result":"..."}),
+        # which was previously discarded entirely on a non-zero exit.
+        try:
+            stdout_raw = json.loads(proc.stdout.decode("utf-8", "ignore"))
+            if stdout_raw.get("is_error") and stdout_raw.get("result"):
+                detail = f"{stdout_raw['result']}" + (f" (stderr: {detail})" if detail else "")
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        logger.error(f"Claude CLI [{label}] exit {proc.returncode}: {detail}")
         return None
     try:
         raw = json.loads(proc.stdout.decode("utf-8", "ignore"))

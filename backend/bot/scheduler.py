@@ -14,10 +14,12 @@ from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from bot.delta_client import DeltaClient
+from bot.delta_client import DeltaClient, vwap_fill
 from bot.indicators import compute_indicators
 from bot.lux_indicators import supertrend_ai, trendline_breakout_navigator, fair_value_gaps, inverse_fvg, _atr
 from bot import strategies, autotune, ai_brain, smc, edge as edge_mod, news
+from bot import divergence as divergence_mod, funding as funding_mod, orderbook as orderbook_mod
+from bot import portfolio_risk
 from config import settings
 from db import db
 
@@ -28,7 +30,7 @@ _bot_running = False
 _delta = DeltaClient()
 
 
-def _analyze(candles):
+def _analyze(candles, vwap_candles=None):
     """Compute every indicator for one timeframe."""
     ind = compute_indicators(
         candles,
@@ -37,6 +39,14 @@ def _analyze(candles):
         rsi_period=settings.rsi_period,
         rsi_oversold=settings.rsi_oversold,
         rsi_overbought=settings.rsi_overbought,
+        bb_period=settings.bb_period,
+        bb_mult=settings.bb_mult,
+        kc_period=settings.kc_period,
+        kc_atr_mult=settings.kc_atr_mult,
+        kc_atr_len=settings.kc_atr_len,
+        adx_period=settings.adx_period,
+        vwap_enabled=settings.vwap_enabled,
+        vwap_candles=vwap_candles,
     )
     st = supertrend_ai(candles)
     tn = trendline_breakout_navigator(candles, term=settings.trendline_term)
@@ -263,6 +273,59 @@ async def _daily_loss_exceeded(balance: float) -> tuple[bool, float, float]:
     return (total <= limit), round(total, 2), round(limit, 2)
 
 
+async def _liquidity_check(symbol: str, want_long: bool, lots: int = 0) -> tuple[bool, str]:
+    """Is this market tradeable right now?
+
+    Two questions, both asked BEFORE committing capital:
+      1. Is the quoted spread sane? A wide book means the entry itself is a loss.
+      2. Could we actually EXIT this size? Never enter a market you can't leave —
+         a position you can only close at a real concession is a trap, not a trade.
+    """
+    try:
+        book = await _delta.get_orderbook(symbol)
+        t = await _delta.get_ticker(symbol)
+        mark = float(t.get("mark_price") or t.get("close") or 0)
+    except Exception as e:
+        return False, f"order book unavailable ({type(e).__name__})"
+    bids, asks = book.get("buy") or [], book.get("sell") or []
+    if not bids or not asks or not mark:
+        return False, "empty order book"
+
+    bid, ask = float(bids[0]["price"]), float(asks[0]["price"])
+    spread_pct = (ask - bid) / mark * 100
+    if spread_pct > settings.max_entry_spread_pct:
+        return False, f"spread {spread_pct:.2f}% > {settings.max_entry_spread_pct:g}% (illiquid)"
+
+    if lots > 0:
+        # exiting a long sells into bids; exiting a short buys from asks
+        exit_levels = bids if want_long else asks
+        px, got = vwap_fill(exit_levels, lots)
+        if got < lots - 1e-9 or not px:
+            return False, f"book too thin to exit {lots} lots"
+        exit_slip = abs(px - mark) / mark * 100
+        if exit_slip > settings.max_exit_slippage_pct:
+            return False, (f"exit would cost {exit_slip:.2f}% "
+                           f"(> {settings.max_exit_slippage_pct:g}%) — unexitable")
+    return True, f"spread {spread_pct:.2f}%"
+
+
+async def _liquidity_gate(symbol: str, want_long: bool, lots: int = 0) -> tuple[bool, str, dict]:
+    """Wraps `_liquidity_check` with the shadow/enforce mode switch.
+
+    In "shadow" mode the check still runs and is still logged, but never blocks a
+    trade — this exists to gather real block-rate data (the testnet book, ETH's
+    especially, is sometimes empty) before ever flipping to "enforce".
+    Returns (allow_trade, status_text, log_meta).
+    """
+    if not settings.liquidity_gate_enabled or settings.liquidity_gate_mode == "off":
+        return True, "", {"mode": "off"}
+    ok, txt = await _liquidity_check(symbol, want_long, lots)
+    meta = {"mode": settings.liquidity_gate_mode, "ok": ok, "reason": txt, "lots": lots}
+    if not ok and settings.liquidity_gate_mode == "enforce":
+        return False, txt, meta
+    return True, txt, meta
+
+
 def _symbol_profile(symbol: str, big: bool) -> dict | None:
     """POINT-based SL/TP limits for symbols that use them (ETH). Returns None for
     symbols that keep the percent-based logic (e.g. BTC)."""
@@ -457,6 +520,7 @@ async def _manage_open_position(symbol: str):
                         # Train on the DECISION (mark->mark), not on what a thin book paid.
                         train_r = o["strategy_r"] if settings.autotune_use_mark_pnl else o["execution_r"]
                         await autotune.record_outcome(state.get("votes") or {}, action, train_r)
+                        await autotune.record_shadow_outcome(state.get("shadow_votes") or {}, action, train_r)
                         logger.info(
                             f"{symbol} closed — strategy {o['strategy_pnl']:+.2f} ({o['strategy_r']:+.2f}R) "
                             f"| execution {o['execution_pnl']:+.2f} ({o['execution_r']:+.2f}R) "
@@ -590,24 +654,60 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
             logger.warning("Not enough entry-timeframe candles yet, skipping tick.")
             return
 
+        # VWAP needs REAL trade volume — mark-price candles (the default candle
+        # source everywhere else) carry none. Fetch a parallel traded-price set just
+        # for that, and only on the deep pass (the latency-sensitive fast pass skips
+        # this extra fetch, same as it already skips historical_edge/news).
+        c_entry_vol = None
+        if settings.vwap_enabled and not fast:
+            try:
+                c_entry_vol = await _delta.get_candles(symbol, settings.entry_timeframe, settings.candle_limit, mark=False)
+            except Exception as e:
+                logger.warning(f"[{symbol}] traded-volume candles for VWAP failed: {e}")
+
         # 2. Analyze each timeframe (off the event loop — CPU-heavy)
-        (ind, st, tn, fvg, ifvg), (ind_t, st_t, tn_t, _, _), (ind_l, st_l, tn_l, _, _), smc_e, smc_t, smc_l = await asyncio.gather(
-            asyncio.to_thread(_analyze, c_entry),         # entry / decision (15m)
+        (ind, st, tn, fvg, ifvg), (ind_t, st_t, tn_t, _, _), (ind_l, st_l, tn_l, _, _), smc_e, smc_t, smc_l, divergence = await asyncio.gather(
+            asyncio.to_thread(_analyze, c_entry, c_entry_vol),  # entry / decision (15m)
             asyncio.to_thread(_analyze, c_trend),         # trend / bias (1h)
             asyncio.to_thread(_analyze, c_ltf),           # timing (5m)
             asyncio.to_thread(smc.analyze, c_entry),      # SMC read (15m)
             asyncio.to_thread(smc.analyze, c_trend),      # SMC read (1h)
             asyncio.to_thread(smc.analyze, c_ltf),        # SMC read (5m)
+            asyncio.to_thread(divergence_mod.detect_divergence, c_entry,
+                              settings.divergence_swing_left, settings.divergence_swing_right),
         )
         bias = _trend_bias(ind_t, st_t, tn_t)
         bias_txt = {1: "bullish", -1: "bearish", 0: "neutral"}[bias]
 
+        # Crypto-native shadow signals: funding-rate bias (skipped on fast passes —
+        # a slow-moving signal that doesn't need 15s-cadence history writes) and
+        # order-book imbalance (cheap; get_orderbook has its own short-TTL cache).
+        funding_read = None
+        if not fast:
+            try:
+                funding_read = await funding_mod.record_and_bias(symbol, _delta)
+            except Exception as e:
+                logger.warning(f"[{symbol}] funding read failed: {e}")
+        orderbook_read = None
+        try:
+            orderbook_read = orderbook_mod.imbalance(await _delta.get_orderbook(symbol))
+        except Exception as e:
+            logger.warning(f"[{symbol}] orderbook read failed: {e}")
+
         # 3. Entry votes on the lower timeframe (need >= min_signals)
         enabled = strategies.parse_enabled(settings.strategies)
+        shadow = strategies.parse_enabled(settings.shadow_strategies)
         ctx = strategies.StrategyContext(candles=c_entry, ind=ind, supertrend=st, trendline=tn, fvg=fvg, ifvg=ifvg,
-                                         extra={"smc": smc_e, "smc_trend": smc_t})
-        result = strategies.evaluate(ctx, enabled, settings.min_signals, weights)
+                                         extra={"smc": smc_e, "smc_trend": smc_t, "divergence": divergence,
+                                                "funding": funding_read, "orderbook_imbalance": orderbook_read})
+        result = strategies.evaluate(ctx, enabled, settings.min_signals, weights, shadow=shadow)
         entry_action = result["action"]
+
+        # ADX regime gate: in a non-trending 1h market, trend-following entries have
+        # no edge — block BOTH the mechanical vote and (below) an AI-driven decide.
+        # Off by default until backtest-validated (see GET /bot/backtest COMBINED_ADX_GATED).
+        adx_now = (ind_t or {}).get("adx")
+        adx_blocks = bool(settings.adx_gate_enabled and adx_now is not None and adx_now < settings.adx_min_trend)
 
         # 3b. Higher-TF filter: don't fight the 1h trend
         action = entry_action
@@ -617,6 +717,9 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
         elif entry_action == "SELL" and bias > 0:
             action = "HOLD"
             reason = f"Blocked — 15m wanted SELL but 1h trend is bullish | {result['reason']}"
+        elif entry_action in ("BUY", "SELL") and adx_blocks:
+            action = "HOLD"
+            reason = f"Blocked — 1h ADX {adx_now:.1f} < {settings.adx_min_trend:g} (ranging) | {result['reason']}"
         else:
             reason = f"1h trend {bias_txt} | {result['reason']}"
 
@@ -638,7 +741,8 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                     ind_t, st_t, tn_t, bias_txt, result["votes"], weights, {},
                     smc_entry=smc_e, smc_trend=smc_t,
                     c_ltf=c_ltf, ind_l=ind_l, st_l=st_l, tn_l=tn_l, smc_ltf=smc_l,
-                    historical_edge=hist_edge, news=news_ctx)
+                    historical_edge=hist_edge, news=news_ctx,
+                    divergence=divergence, funding=funding_read, orderbook=orderbook_read)
                 chain = ai_brain.FAST_PROVIDERS if fast else ai_brain.DEFAULT_PROVIDERS
                 ai_plan = await asyncio.to_thread(ai_brain.analyze, snapshot, chain)
             except Exception as e:
@@ -653,6 +757,9 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
             ):
                 action = "HOLD"
                 reason = f"AI wanted {cand} but blocked by 1h {bias_txt} trend | {ai_plan['reasoning']}"
+            elif cand in ("BUY", "SELL") and adx_blocks:
+                action = "HOLD"
+                reason = f"AI wanted {cand} but blocked by 1h ADX {adx_now:.1f} < {settings.adx_min_trend:g} (ranging) | {ai_plan['reasoning']}"
             else:
                 action = cand
                 ai_drove = cand in ("BUY", "SELL")
@@ -678,6 +785,8 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
         fraction = 0.0
         rr = float(settings.risk_reward)
         price = ind["close"]
+        liq_meta = None
+        expectancy_meta = None
         if action in ("BUY", "SELL"):
             side = action.lower()
             want_long = action == "BUY"
@@ -707,6 +816,13 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                         order_status = f"skipped: max {settings.max_concurrent_positions} concurrent positions open"
                         logger.info(f"{symbol} flat + {action} signal but {n_open} positions already open — skipping")
                         raise _SkipEntry()
+                    # liquidity gate (spread): a market this wide costs more to enter and
+                    # exit than the edge is worth. Shadow mode logs this without blocking.
+                    ok_liq, liq_txt, liq_meta = await _liquidity_gate(symbol, want_long)
+                    if not ok_liq:
+                        order_status = f"skipped: {liq_txt}"
+                        logger.info(f"{symbol} entry blocked — liquidity: {liq_txt}")
+                        raise _SkipEntry()
                     # news blackout: don't open a NEW trade into a high-impact release (whipsaw risk)
                     blocked, ev = await news.in_blackout()
                     if blocked:
@@ -723,6 +839,21 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                         order_status = f"skipped: daily loss limit hit (today {day_pnl} <= {day_limit})"
                         logger.warning(f"{symbol} entry blocked — daily loss limit reached (today ${day_pnl} <= ${day_limit})")
                         raise _SkipEntry()
+                    # expectancy/profitability gate: only trade vote combinations that have
+                    # REAL backtested edge on this symbol (not just enough votes agreeing).
+                    expectancy_meta = await edge_mod.blended_expectancy(symbol, result["votes"], action, weights)
+                    if settings.expectancy_gate_enabled:
+                        if expectancy_meta["blended_exp"] is None:
+                            if not settings.expectancy_gate_fail_open:
+                                order_status = "skipped: expectancy gate — no qualifying backtested evidence for this vote"
+                                logger.info(f"{symbol} entry blocked — expectancy gate: no qualifying evidence")
+                                raise _SkipEntry()
+                        elif expectancy_meta["blended_exp"] < settings.expectancy_gate_min_R:
+                            order_status = (f"skipped: expectancy gate — blended {expectancy_meta['blended_exp']:+.3f}R "
+                                            f"< min {settings.expectancy_gate_min_R:+.3f}R")
+                            logger.info(f"{symbol} entry blocked — expectancy gate: "
+                                        f"{expectancy_meta['blended_exp']:+.3f}R < {settings.expectancy_gate_min_R:+.3f}R")
+                            raise _SkipEntry()
                     # "big" trade: most indicators agree -> allow a wider stop + larger
                     # target with a smaller position (special case).
                     agree = result["buy_score"] if want_long else result["sell_score"]
@@ -770,6 +901,44 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                         # CAPITAL-BASED sizing: deploy a fixed % of balance as margin
                         # (50% normal, less for big trades -> smaller lots).
                         cap_pct = settings.big_trade_capital_pct if big else settings.position_capital_pct
+
+                        # Correlation-aware dampening: don't silently double correlated
+                        # exposure when another open position (different symbol, same
+                        # direction) is highly correlated with this one.
+                        corr_used = None
+                        if settings.correlation_check_enabled:
+                            try:
+                                for p in await _delta.get_positions():
+                                    other_sym = p.get("product_symbol")
+                                    other_size = float(p.get("size") or 0)
+                                    if not other_sym or other_sym == symbol or not other_size:
+                                        continue
+                                    if (other_size > 0) != want_long:
+                                        continue  # opposite direction — no correlated stacking
+                                    corr_used = await portfolio_risk.realized_correlation(
+                                        _delta, symbol, other_sym, settings.correlation_timeframe_min,
+                                        settings.correlation_lookback_bars)
+                                    if corr_used is not None and corr_used >= settings.correlation_high_threshold:
+                                        cap_pct *= settings.correlation_dampen_factor
+                                        logger.info(f"{symbol} sizing dampened {settings.correlation_dampen_factor:g}x "
+                                                    f"— {corr_used:.2f} correlated with open {other_sym} {side}")
+                                        break
+                            except Exception as e:
+                                logger.warning(f"{symbol} correlation check failed ({type(e).__name__}) — using full size")
+
+                        # Volatility-adjusted sizing: scale capital deployed inversely with
+                        # current ATR%, so risk normalizes across volatility regimes instead
+                        # of a flat capital allocation regardless of how choppy price is.
+                        vol_scalar_used = None
+                        if settings.vol_sizing_enabled and price > 0:
+                            atr_list = _atr(c_entry, settings.atr_period)
+                            atr_now = atr_list[-1] if atr_list else 0.0
+                            if atr_now > 0:
+                                atr_pct = atr_now / price * 100
+                                vol_scalar_used = min(max(settings.vol_ref_atr_pct / atr_pct,
+                                                          settings.vol_scalar_min), settings.vol_scalar_max)
+                                cap_pct *= vol_scalar_used
+
                         margin_usd = total_bal * cap_pct / 100.0
                         # respect the available-balance ceiling
                         margin_usd = min(margin_usd, avail * settings.margin_cap_pct)
@@ -783,6 +952,15 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                         strength = st_t["latest"].get("strength", 0) if st_t else 0
                         aligned = (bias > 0 and want_long) or (bias < 0 and not want_long)
                         rr = max(_rr_target(agree, strength, aligned), settings.risk_reward)
+
+                        # size-aware exit check: now that lots are known, confirm the book
+                        # could actually absorb closing this position. Shadow mode logs
+                        # this without blocking (see liq_meta on the earlier spread check).
+                        ok_exit, exit_txt, liq_meta = await _liquidity_gate(symbol, want_long, lots)
+                        if not ok_exit:
+                            order_status = f"skipped: {exit_txt}"
+                            logger.info(f"{symbol} entry blocked — {exit_txt}")
+                            raise _SkipEntry()
 
                         # 1) ENTRY (market, no bracket — we manage TP/SL ourselves)
                         order = await _delta.place_order(symbol, side, lots)
@@ -842,7 +1020,8 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                             {"_id": symbol, "side": side, "size": lots, "entry": entry_ref,
                              "fill_price": fill_price,
                              "sl": sl_price, "tps": placed_tps, "rr": rr, "be_moved": False,
-                             "votes": result["votes"], "risk_dollars": round(risk_dollars, 4),
+                             "votes": result["votes"], "shadow_votes": result.get("shadow_votes") or {},
+                             "risk_dollars": round(risk_dollars, 4),
                              "sl_method": sl_method, "tp_source": tp_source, "ai": ai_meta,
                              "leverage": lev, "big_trade": big, "capital_pct": cap_pct,
                              "opened_at": datetime.now(timezone.utc)},
@@ -904,6 +1083,8 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                        "stop_loss": round(sl_price, 2) if sl_price else None,
                        "take_profit": round(tp_price, 2) if tp_price else None},
             "ai": ai_meta,
+            "liquidity": liq_meta,
+            "expectancy_gate": expectancy_meta,
             "order_id": order_id,
             "order_status": order_status,
             "paper_trade": True,

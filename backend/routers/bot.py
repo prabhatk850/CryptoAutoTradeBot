@@ -30,13 +30,18 @@ async def status():
 
 
 @router.get("/backtest")
-async def backtest(symbol: str = None, bars: int = 1500):
-    """Backtest every strategy + the combined engine on recent history."""
+async def backtest(symbol: str = None, bars: int = 1500, adx_gate_min: float = None):
+    """Backtest every strategy + the combined engine on recent history.
+
+    Pass `adx_gate_min` (e.g. settings.adx_min_trend = 20) to also get a
+    COMBINED_ADX_GATED row for a direct before/after comparison — the evidence
+    used to decide config.adx_gate_enabled's default.
+    """
     sym = symbol or settings.trading_symbol
     try:
         c_entry = await _delta.get_candles(sym, settings.entry_timeframe, bars)
         c_trend = await _delta.get_candles(sym, settings.trend_timeframe, max(bars // 4, 300))
-        res = await asyncio.to_thread(run_backtest, c_entry, c_trend)
+        res = await asyncio.to_thread(run_backtest, c_entry, c_trend, None, None, adx_gate_min)
         res["symbol"] = sym
         res["entry_tf"] = settings.entry_timeframe
         res["trend_tf"] = settings.trend_timeframe
@@ -49,6 +54,15 @@ async def backtest(symbol: str = None, bars: int = 1500):
 async def performance():
     """Live per-strategy performance + the auto-tuned vote weights."""
     return await autotune.status()
+
+
+@router.get("/performance/shadow")
+async def performance_shadow():
+    """Performance of shadow-only strategies (config.shadow_strategies) — crypto-
+    native signals like funding-rate bias and order-book imbalance that can't be
+    backtested (no stored history) so they build a live track record on a side
+    ledger before ever being promoted into the real, voting `strategies` CSV."""
+    return await autotune.shadow_status()
 
 
 def _skip_bucket(status: str) -> str:
@@ -66,6 +80,8 @@ def _skip_bucket(status: str) -> str:
         return "No room for 1:2 target"
     if "already in position" in s or "held" in s:
         return "Already in a position"
+    if "expectancy gate" in s:
+        return "Low historical edge"
     return "Other"
 
 
@@ -104,6 +120,19 @@ async def training(days: int = 30, limit: int = 60):
         except Exception:
             return 0
 
+    async def _liquidity_shadow():
+        """How often the (currently shadow-mode) liquidity gate WOULD have blocked
+        a trade, so enforcing it can be a data-driven decision rather than a guess."""
+        try:
+            total = await db.trade_logs.count_documents(
+                {"timestamp": {"$gte": since}, "liquidity.mode": "shadow"})
+            would_block = await db.trade_logs.count_documents(
+                {"timestamp": {"$gte": since}, "liquidity.mode": "shadow", "liquidity.ok": False})
+            return {"mode": settings.liquidity_gate_mode, "checked": total, "would_have_blocked": would_block,
+                    "would_block_pct": round(would_block / total * 100, 1) if total else 0}
+        except Exception:
+            return {"mode": settings.liquidity_gate_mode, "checked": 0, "would_have_blocked": 0, "would_block_pct": 0}
+
     async def _skips():
         try:
             rows = {}
@@ -117,8 +146,8 @@ async def training(days: int = 30, limit: int = 60):
         except Exception:
             return {}
 
-    perf, outcomes, skips, unverified = await asyncio.gather(
-        autotune.status(), _outcomes(), _skips(), _unverified())
+    perf, outcomes, skips, unverified, liq_shadow = await asyncio.gather(
+        autotune.status(), _outcomes(), _skips(), _unverified(), _liquidity_shadow())
 
     for o in outcomes:
         o["_id"] = str(o.get("_id", ""))
@@ -161,6 +190,7 @@ async def training(days: int = 30, limit: int = 60):
             "stale_days": stale_days,
         },
         "strategies": perf["strategies"],
+        "liquidity_gate": liq_shadow,
         "recent_trades": outcomes,
         "skipped": [{"reason": k, "count": v} for k, v in
                     sorted(skips.items(), key=lambda kv: -kv[1])],

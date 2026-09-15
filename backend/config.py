@@ -233,6 +233,24 @@ class Settings(BaseSettings):
     # a wide book eats the edge on the way in, and an empty one traps the position.
     max_entry_spread_pct: float = 0.15    # quoted bid/ask spread vs mark
     max_exit_slippage_pct: float = 0.40   # cost of closing the intended size
+    # Master switch + mode for the liquidity gate. "shadow" runs the check and logs
+    # what it WOULD have done without ever blocking a trade — use this first to see
+    # real block-rate data (ETH's testnet book is sometimes empty) before "enforce".
+    liquidity_gate_enabled: bool = True
+    liquidity_gate_mode: str = "shadow"   # "off" | "shadow" | "enforce"
+
+    # Pre-trade expectancy/profitability gate: require the strategies backing the
+    # proposed action to have REAL backtested edge on this symbol (from bot/edge.py)
+    # before committing capital — not just "enough strategies agree".
+    expectancy_gate_enabled: bool = True
+    # The original +0.05 (demand a margin ABOVE breakeven) blocked ~100% of
+    # BTCUSD/ETHUSD entries for 24h+ live — the persistent blocked case measured
+    # -0.056R, which is only mildly negative, not a clearly-bad setup. -0.1 blocks
+    # setups with a real demonstrated negative edge while letting near-breakeven
+    # ones (which is most real setups here; PFs cluster ~0.96-1.19) through.
+    expectancy_gate_min_R: float = -0.1        # min blended backtested expectancy (R) required
+    expectancy_gate_min_strategy_n: int = 15   # backtested trades needed before a strategy's edge counts
+    expectancy_gate_fail_open: bool = True     # allow the trade when there's no qualifying evidence yet
     # Train the strategy tuner on mark→mark P/L (the DECISION) rather than on fills
     # (the VENUE). Set false only on a venue whose fills you trust completely.
     autotune_use_mark_pnl: bool = True
@@ -242,6 +260,46 @@ class Settings(BaseSettings):
     rsi_period: int = 14
     rsi_oversold: float = 30.0
     rsi_overbought: float = 70.0
+
+    # --- New indicators: Bollinger/Keltner squeeze, ADX, VWAP -------------------- #
+    bb_period: int = 20
+    bb_mult: float = 2.0
+    kc_period: int = 20
+    kc_atr_mult: float = 1.5
+    kc_atr_len: int = 10
+    adx_period: int = 14
+    vwap_enabled: bool = True
+
+    # ADX trend-strength GATE (global filter, not a vote): ranging markets (low ADX)
+    # get no trend-following edge, so block entries there. Off by default until
+    # backtest-validated per symbol (see GET /bot/backtest COMBINED_ADX_GATED).
+    adx_gate_enabled: bool = False
+    adx_min_trend: float = 20.0   # standard Wilder no-trend threshold
+
+    # Divergence swing detection (RSI vs price at swing points).
+    divergence_swing_left: int = 2
+    divergence_swing_right: int = 2
+
+    # --- Crypto-native strategies, shadow-mode validated (never influence real
+    # trades until proven positive-expectancy live — see GET /bot/performance/shadow) --- #
+    shadow_strategies: str = "FUNDING_BIAS,ORDERBOOK_IMBALANCE"
+    funding_history_window_days: int = 30
+    funding_min_history_samples: int = 20
+    funding_extreme_percentile: float = 0.90   # >=90th / <=10th percentile = "extreme"
+    ob_imbalance_levels: int = 10
+    ob_imbalance_threshold: float = 0.35       # |bid-ask skew| beyond this casts a vote
+
+    # --- Portfolio-level risk: correlation-aware sizing + volatility-adjusted sizing --- #
+    correlation_check_enabled: bool = True
+    correlation_lookback_bars: int = 200
+    correlation_timeframe_min: int = 60
+    correlation_high_threshold: float = 0.7
+    correlation_dampen_factor: float = 0.5     # cap_pct multiplier when highly correlated & same direction
+
+    vol_sizing_enabled: bool = False           # off by default — changes real sizing math
+    vol_ref_atr_pct: float = 0.5               # "normal" ATR% of price this sizing is calibrated to
+    vol_scalar_min: float = 0.4
+    vol_scalar_max: float = 1.5
 
     model_config = SettingsConfigDict(env_file=str(_ROOT_ENV), extra="ignore")
 
