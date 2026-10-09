@@ -1,12 +1,11 @@
-# Keeps the ForexBot dashboard (Next.js) running. Builds once, then serves.
-# Restarts automatically if it crashes.
+# Builds the dashboard once, then serves it and restarts it if it crashes.
 $ErrorActionPreference = "Continue"
 $frontend = Join-Path $PSScriptRoot "..\frontend"
 $logFile  = Join-Path $PSScriptRoot "frontend.log"
+$env:BACKEND_INTERNAL_URL = "http://127.0.0.1:8000"   # /api proxy target, baked in at build time
 
 Set-Location $frontend
 
-# Production build once (skip if .next already built and up to date)
 "$(Get-Date -Format o)  building frontend..." | Tee-Object -FilePath $logFile -Append
 npm run build *>> $logFile
 

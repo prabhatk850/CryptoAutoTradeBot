@@ -1,15 +1,4 @@
-"""
-RSI/price divergence detection at swing points (regular + hidden, both directions).
-
-  Regular bullish:  price Lower Low,  RSI Higher Low   -> reversal up
-  Regular bearish:  price Higher High, RSI Lower High  -> reversal down
-  Hidden bullish:   price Higher Low, RSI Lower Low    -> uptrend continuation
-  Hidden bearish:   price Lower High, RSI Higher High  -> downtrend continuation
-
-Returns the FULL signal history (not just the last bar), the same shape convention
-fair_value_gaps()/inverse_fvg() use (a `signals` list + a `latest` pointer), so
-bot/backtest.py can replay this strategy bar-by-bar instead of only checking "now".
-"""
+"""RSI/price divergence at swing points: regular = reversal, hidden = continuation."""
 from __future__ import annotations
 from typing import Optional
 
@@ -18,6 +7,7 @@ from bot.swings import find_swings
 
 
 def detect_divergence(candles: list[dict], left: int = 2, right: int = 2, rsi_period: int = 14) -> Optional[dict]:
+    """Full signal history plus `latest` (so the backtest can replay it bar by bar)."""
     n = len(candles)
     if n < max(left + right + 5, rsi_period + 5):
         return None
@@ -55,7 +45,6 @@ def detect_divergence(candles: list[dict], left: int = 2, right: int = 2, rsi_pe
     latest = None
     if signals:
         latest = dict(signals[-1])
-        # "fresh" = the confirming swing landed at (or very near) the newest bar a
-        # swing can possibly be confirmed at — an old divergence is not a live signal.
+        # Fresh = confirmed at the newest bar a swing can be; older divergences are not live.
         latest["fresh"] = (n - 1 - latest["i"]) <= (right + 2)
     return {"signals": signals, "latest": latest}

@@ -26,8 +26,7 @@ export interface SuperTrendData {
 
 export interface TrendlineData {
   points: { time: number; upper: number | null; lower: number | null }[];
-  // The two currently-active trendlines (one descending from the latest swing high,
-  // one ascending from the latest swing low) as clean straight rays.
+  // The two active trendlines as straight rays from their anchor swings.
   active?: { time: number; upper: number | null; lower: number | null }[];
 }
 
@@ -194,14 +193,7 @@ const istDay = new Intl.DateTimeFormat("en-IN", { timeZone: IST, day: "numeric",
 const istMonth = new Intl.DateTimeFormat("en-IN", { timeZone: IST, month: "short" });
 const istYear = new Intl.DateTimeFormat("en-IN", { timeZone: IST, year: "numeric" });
 
-/**
- * Format an axis tick for the span it represents, not always as a clock time.
- *
- * lightweight-charts passes a TickMarkType telling us what the label stands for
- * (Year / Month / DayOfMonth / Time). Formatting everything as HH:mm made daily
- * candles — which all open at 00:00 UTC, i.e. 05:30 IST — render as an endless
- * row of identical "05:30" labels.
- */
+/** Axis label by tick type (year/month/day/time) — HH:mm everywhere made daily candles all read "05:30". */
 function formatTick(t: number, tickMarkType: TickMarkType): string {
   const d = new Date(t * 1000);
   switch (tickMarkType) {
@@ -285,8 +277,7 @@ export default function TradingViewChart({
       smcZonesPrimRef.current = smcPrim;
     } catch { /* primitive API unavailable */ }
 
-    // invisible line series that hosts SMC swing/break markers so they never
-    // clobber the trade markers on the candle series
+    // Invisible series hosting SMC markers so they don't replace the trade markers.
     smcMarkerSeriesRef.current = chart.addLineSeries({
       color: "rgba(0,0,0,0)", lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false,
     });
@@ -356,8 +347,7 @@ export default function TradingViewChart({
     const chart = chartRef.current, series = candleRef.current;
     if (!chart || !series || candles.length === 0) return;
 
-    // Sanitize: drop any candle with a null/NaN OHLC or bad time, sort ascending,
-    // and dedupe timestamps (Lightweight Charts crashes on null values or dup times).
+    // Drop bad/NaN candles, sort, dedupe times (lightweight-charts crashes otherwise).
     const num = (v: any) => (typeof v === "number" ? v : Number(v));
     const cleaned = candles
       .map((c) => ({
@@ -477,8 +467,7 @@ export default function TradingViewChart({
       const t = (typeof p.time === "number" ? p.time : Number(p.time)) as UTCTimestamp;
       if (!Number.isFinite(t as number) || (t as number) <= lastT) continue;
       lastT = t as number;
-      // whitespace point (time only) where the line isn't active, so each side
-      // renders as a single continuous diagonal ray with no connecting jumps.
+      // Whitespace points where inactive, so each side renders as one clean ray.
       lower.push(p.lower != null ? { time: t, value: p.lower } : { time: t });
       upper.push(p.upper != null ? { time: t, value: p.upper } : { time: t });
     }
@@ -517,8 +506,7 @@ export default function TradingViewChart({
     prim.setZones(zones);
   }, [fvg, ifvg, showFvg, showIfvg, candles]);
 
-  // ---- SMC overlays: order-block zones, premium/discount shading, liquidity &
-  //      structure lines, swing (HH/HL/LH/LL) + sweep markers ----
+  // SMC overlays: order blocks, premium/discount, liquidity/structure lines, swing + sweep markers.
   useEffect(() => {
     const series = candleRef.current;
     const prim = smcZonesPrimRef.current;

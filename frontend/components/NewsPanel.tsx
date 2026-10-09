@@ -40,8 +40,7 @@ const SENTIMENT_DOT: Record<string, string> = {
   neutral: "bg-gray-500",
 };
 
-// Per-outlet chip colour, so you can tell at a glance where a headline came from.
-// Anything unrecognised falls back to neutral grey rather than going uncoloured.
+// Per-outlet chip colour; unknown sources fall back to grey.
 const SOURCE_CHIP: Record<string, string> = {
   cointelegraph: "text-amber-300 bg-amber-500/10 border-amber-500/25",
   coindesk: "text-sky-300 bg-sky-500/10 border-sky-500/25",
@@ -58,9 +57,7 @@ const SOURCE_CHIP: Record<string, string> = {
 const sourceChip = (source: string) =>
   SOURCE_CHIP[(source || "").toLowerCase()] ?? "text-gray-400 bg-gray-500/10 border-gray-600/30";
 
-// Impact drives both the left rail and the currency chip, so severity is scannable
-// down the column. Low is sky rather than yellow — amber/yellow read as the same
-// colour at this size.
+// Impact colours the rail and currency chip (low = sky; yellow is indistinguishable from amber here).
 function impactColor(rank: number) {
   if (rank >= 3) return { bar: "bg-red-500", chip: "text-red-300 bg-red-500/15" };        // High
   if (rank === 2) return { bar: "bg-amber-500", chip: "text-amber-300 bg-amber-500/15" }; // Medium
@@ -126,9 +123,7 @@ export default function NewsPanel() {
   // The panel scrolls, so keep the cap well above a full ForexFactory week (~70 events).
   const calRows = (upcoming.length ? upcoming : events).slice(0, 100);
 
-  // On lg the panel is absolutely pinned to its (relative) column so it spans exactly
-  // from the top of the page to the bottom of the chart card without stretching the
-  // row; the two lists below split that height and scroll inside it.
+  // On lg the panel is pinned to its column's height; the two lists split it and scroll inside.
   return (
     <div className="bg-[#161b22] border border-[#30363d] rounded-xl p-3 flex flex-col gap-3 lg:absolute lg:inset-0">
       <div className="flex items-center justify-between px-1">

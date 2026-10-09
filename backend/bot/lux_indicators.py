@@ -1,45 +1,12 @@
-"""
-Python port of LuxAlgo's "SuperTrend AI (Clustering)" indicator.
+"""Python ports of LuxAlgo indicators (SuperTrend AI, Trendlines with Breaks, FVG, IFVG).
+
 © LuxAlgo — CC BY-NC-SA 4.0 (https://creativecommons.org/licenses/by-nc-sa/4.0/)
-
-Faithful port of the Pine v5 logic:
-  - Compute SuperTrend for a range of ATR factors.
-  - Track a performance metric (perf) per factor.
-  - K-means (3 clusters) on perf each bar; pick Best/Average/Worst cluster.
-  - Recompute a final SuperTrend with the cluster's average factor -> trailing
-    stop (ts), trend direction (os), performance index, and an adaptive MA.
-  - Signals fire on each trend flip; strength = round(perf_idx * 10).
-
-All functions take the normalized candle list from delta_client.get_candles
-(dicts with time/open/high/low/close).
 """
 import math
+import statistics
 from typing import Optional
 
-
-def _atr(candles: list[dict], length: int) -> list[float]:
-    n = len(candles)
-    tr = [0.0] * n
-    for i, c in enumerate(candles):
-        if i == 0:
-            tr[i] = c["high"] - c["low"]
-        else:
-            pc = candles[i - 1]["close"]
-            tr[i] = max(c["high"] - c["low"], abs(c["high"] - pc), abs(c["low"] - pc))
-    atr: list[Optional[float]] = [None] * n
-    prev = None
-    s = 0.0
-    for i in range(n):
-        if i < length:
-            s += tr[i]
-            if i == length - 1:
-                prev = s / length
-                atr[i] = prev
-        else:
-            prev = (prev * (length - 1) + tr[i]) / length
-            atr[i] = prev
-    first = next((a for a in atr if a is not None), tr[0] if tr else 0.0)
-    return [a if a is not None else first for a in atr]
+from bot.indicators import calc_atr
 
 
 def _percentile(data: list[float], p: float) -> float:
@@ -67,13 +34,14 @@ def supertrend_ai(
     from_cluster: str = "Best",
     max_iter: int = 50,
 ) -> Optional[dict]:
+    """SuperTrend over a factor range, k-means on per-factor performance, final line from the best cluster."""
     n = len(candles)
     if n < atr_len + 2:
         return None
 
     hl2 = [(c["high"] + c["low"]) / 2 for c in candles]
     close = [c["close"] for c in candles]
-    atr = _atr(candles, atr_len)
+    atr = calc_atr(candles, atr_len)
 
     factors = []
     i = 0
@@ -204,223 +172,13 @@ def supertrend_ai(
     }
 
 
-# =========================================================================== #
-#  Trendline Breakout Navigator (LuxAlgo) — faithful port
-#  © LuxAlgo — CC BY-NC-SA 4.0
-# =========================================================================== #
-class _Line:
-    __slots__ = ("x1", "y1", "x2", "y2")
-
-    def __init__(self, x1, y1, x2, y2):
-        self.x1, self.y1, self.x2, self.y2 = x1, y1, x2, y2
-
-    def slope(self):
-        return 0.0 if self.x2 == self.x1 else (self.y2 - self.y1) / (self.x2 - self.x1)
-
-    def get_price(self, bar):
-        return self.y1 + self.slope() * (bar - self.x1)
-
-    def set_xy1(self, x, y):
-        self.x1, self.y1 = x, y
-
-    def set_xy2(self, x, y):
-        self.x2, self.y2 = x, y
-
-
-def _pivots(highs, lows, left, right):
-    n = len(highs)
-    ph = [None] * n
-    pl = [None] * n
-    for t in range(n):
-        p = t - right
-        if p - left < 0 or p + right > n - 1:
-            continue
-        hv = highs[p]
-        if all(hv > highs[p - k] for k in range(1, left + 1)) and all(hv > highs[p + k] for k in range(1, right + 1)):
-            ph[t] = hv
-        lv = lows[p]
-        if all(lv < lows[p - k] for k in range(1, left + 1)) and all(lv < lows[p + k] for k in range(1, right + 1)):
-            pl[t] = lv
-    return ph, pl
-
-
-def _change_flags(arr):
-    n = len(arr)
-    flags = [False] * n
-    last = None
-    for t in range(n):
-        v = arr[t]
-        if v is not None:
-            if last is not None and v != last:
-                flags[t] = True
-            last = v
-    return flags
-
-
-def _draw(candles, left, right=1):
-    """Faithful port of LuxAlgo's per-swing `draw()` -> per-bar (trend, line value)."""
-    n = len(candles)
-    times = [c["time"] for c in candles]
-    highs = [c["high"] for c in candles]
-    lows = [c["low"] for c in candles]
-    closes = [c["close"] for c in candles]
-    ph, pl = _pivots(highs, lows, left, right)
-    cHf, cLf = _change_flags(ph), _change_flags(pl)
-
-    trend = 0
-    prevPh_i = prevPh_p = None
-    prevPl_i = prevPl_p = None
-    line = None
-    slope_v = 0.0
-    active = False
-    cp_i = cp_p = None
-
-    trend_arr = [0] * n
-    value_arr = [None] * n
-    signals = []
-
-    SCAN = 5000
-
-    for b in range(n):
-        chH = cHf[b] and not cLf[b]
-        chL = cLf[b] and not cHf[b]
-        prev_trend = trend
-
-        # extend active line by its slope
-        if active and line is not None:
-            if line.x2 - line.x1 > SCAN:
-                active = False
-            else:
-                line.set_xy2(b, line.y2 + slope_v)
-
-        # ---- pivot-high block ----
-        if chH:
-            tH = times[b - 2] if b >= 2 else times[0]
-            v = -1e18
-            idx = 0
-            for i in range(0, min(SCAN + 1, b + 1)):
-                if highs[b - i] > v:
-                    v, idx = highs[b - i], i
-                if times[b - i] < tH:
-                    break
-            x = b - idx
-            c = closes[b - idx]
-            if trend < 1:
-                if (prevPh_p is not None and prevPl_i is not None
-                        and v > prevPh_p and (x - prevPh_i) > 5 and (b - prevPl_i) < 5000):
-                    trend = 1
-                    line = _Line(prevPl_i, prevPl_p, b, prevPl_p)
-                    slope_v, active, cp_i, cp_p = 0.0, True, prevPl_i, prevPl_p
-                elif active and line is not None and (x - cp_i) != 0:
-                    slope = (v - cp_p) / (x - cp_i)
-                    if v < line.y1 + slope and (v > line.y2 + slope or slope_v == 0):
-                        priceLin = line.get_price(b - idx)
-                        if c < priceLin:
-                            line.set_xy2(b, v + slope * idx)
-                            if slope_v == 0:
-                                guard = 0
-                                while guard < 200:
-                                    guard += 1
-                                    rng = int(b - line.x1)
-                                    arr = [closes[b - i] - line.get_price(b - i) for i in range(0, max(rng, 0) + 1) if b - i >= 0]
-                                    hp = max(arr) if arr else 0.0
-                                    if hp > 0:
-                                        ix = arr.index(hp)
-                                        x1, y1 = b - ix, highs[b - ix]
-                                        cp_i, cp_p = x1, y1
-                                        slope = (v - y1) / (x - x1) if x != x1 else 0.0
-                                        line.set_xy2(b, v + slope * idx)
-                                        line.set_xy1(x1, y1)
-                                        slope_v = slope
-                                    else:
-                                        line.set_xy2(b, v + slope * idx)
-                                        slope_v = slope
-                                        break
-                            else:
-                                slope_v = slope
-                        else:
-                            active = False
-            prevPh_i, prevPh_p = x, v
-        else:
-            if trend < 1 and line is not None and closes[b] > line.y2:
-                active = False
-
-        # ---- pivot-low block (symmetric) ----
-        if chL:
-            tL = times[b - 2] if b >= 2 else times[0]
-            v = 1e18
-            idx = 0
-            for i in range(0, min(SCAN + 1, b + 1)):
-                if lows[b - i] < v:
-                    v, idx = lows[b - i], i
-                if times[b - i] < tL:
-                    break
-            x = b - idx
-            c = closes[b - idx]
-            if trend > -1:
-                if (prevPl_p is not None and prevPh_i is not None
-                        and v < prevPl_p and (x - prevPl_i) > 5 and (b - prevPh_i) < 5000):
-                    trend = -1
-                    line = _Line(prevPh_i, prevPh_p, b, prevPh_p)
-                    slope_v, active, cp_i, cp_p = 0.0, True, prevPh_i, prevPh_p
-                elif active and line is not None and (x - cp_i) != 0:
-                    slope = (v - cp_p) / (x - cp_i)
-                    if v > line.y1 + slope and (v < line.y2 + slope or slope_v == 0):
-                        priceLin = line.get_price(b - idx)
-                        if c > priceLin:
-                            line.set_xy2(b, v + slope * idx)
-                            if slope_v == 0:
-                                guard = 0
-                                while guard < 200:
-                                    guard += 1
-                                    rng = int(b - line.x1)
-                                    arr = [line.get_price(b - i) - closes[b - i] for i in range(0, max(rng, 0) + 1) if b - i >= 0]
-                                    dp = max(arr) if arr else 0.0
-                                    if dp > 0:
-                                        ix = arr.index(dp)
-                                        x1, y1 = b - ix, lows[b - ix]
-                                        cp_i, cp_p = x1, y1
-                                        slope = (v - y1) / (x - x1) if x != x1 else 0.0
-                                        line.set_xy2(b, v + slope * idx)
-                                        line.set_xy1(x1, y1)
-                                        slope_v = slope
-                                    else:
-                                        line.set_xy2(b, v + slope * idx)
-                                        slope_v = slope
-                                        break
-                            else:
-                                slope_v = slope
-                        else:
-                            active = False
-            prevPl_i, prevPl_p = x, v
-        else:
-            if trend > -1 and line is not None and closes[b] < line.y2:
-                active = False
-
-        trend_arr[b] = trend
-        value_arr[b] = line.y2 if line is not None else None
-        if trend != prev_trend and trend != 0:
-            signals.append({"time": times[b], "trend": trend,
-                            "dir": "long" if trend == 1 else "short"})
-
-    return trend_arr, value_arr, signals
-
-
 def fair_value_gaps(
     candles: list[dict],
     threshold_pct: float = 0.0,
     auto: bool = True,
     max_keep: int = 60,
 ) -> Optional[dict]:
-    """
-    Python port of LuxAlgo's "Fair Value Gap" detection.
-    © LuxAlgo — CC BY-NC-SA 4.0
-
-    A bullish FVG = gap where low > high[2] (and close[1] > high[2]); the zone is
-    [high[2] .. low]. Bearish FVG = high < low[2]; zone [high .. low[2]].
-    `threshold` filters tiny gaps (auto = running mean of relative bar range).
-    A gap is "mitigated" once price closes back through it.
-    """
+    """Three-bar gaps (bull: low > high[2]; bear: high < low[2]); mitigated once a close crosses back."""
     n = len(candles)
     if n < 3:
         return None
@@ -461,7 +219,6 @@ def fair_value_gaps(
 
     fvgs = fvgs[-max_keep:]
     unmitigated = [f for f in fvgs if not f["mitigated"]]
-    last_time = times[-1]
     fresh = [f for f in fvgs if f["det_idx"] == n - 1]
     new_dir = ("long" if fresh[-1]["isbull"] else "short") if fresh else None
 
@@ -470,23 +227,14 @@ def fair_value_gaps(
                 "start": f["start"], "mitigated": f["mitigated"], "mitig_time": f["mitig_time"]}
 
     return {
-        "fvgs": [_pub(f) for f in fvgs],
         "unmitigated": [_pub(f) for f in unmitigated],
         "signals": signals,
-        "end": last_time,
-        "bull_count": sum(1 for f in fvgs if f["isbull"]),
-        "bear_count": sum(1 for f in fvgs if not f["isbull"]),
-        "latest": {
-            "new": bool(fresh),
-            "dir": new_dir,
-            "unmitigated_bull": sum(1 for f in unmitigated if f["isbull"]),
-            "unmitigated_bear": sum(1 for f in unmitigated if not f["isbull"]),
-        },
+        "end": times[-1],
+        "latest": {"new": bool(fresh), "dir": new_dir},
     }
 
 
 def _stdev(values: list[float], length: int) -> list[float]:
-    import statistics
     n = len(values)
     out: list[Optional[float]] = [None] * n
     for i in range(n):
@@ -501,18 +249,8 @@ def trendline_breakout_navigator(
     length: int = 14,
     mult: float = 1.0,
     method: str = "atr",
-    term: str = None,   # kept for backward-compat (ignored)
-    **kwargs,
 ) -> Optional[dict]:
-    """
-    Python port of LuxAlgo's "Trendlines with Breaks" (real-time / non-repainting).
-    © LuxAlgo — CC BY-NC-SA 4.0
-
-    Builds a descending upper trendline (anchored at swing highs) and an ascending
-    lower trendline (anchored at swing lows), each sloped by ATR/Stdev. A close
-    above the upper line = bullish break; below the lower line = bearish break.
-    Exposes per-bar upper/lower lines, breakout signals, and a continuous trend.
-    """
+    """Trendlines with Breaks: ATR-sloped lines from swing pivots; a close through one flips the trend."""
     n = len(candles)
     if n < 2 * length + 2:
         return None
@@ -521,9 +259,9 @@ def trendline_breakout_navigator(
     closes = [c["close"] for c in candles]
     times = [int(c["time"]) for c in candles]
 
-    basis = _stdev(closes, length) if str(method).lower() == "stdev" else _atr(candles, length)
+    basis = _stdev(closes, length) if str(method).lower() == "stdev" else calc_atr(candles, length)
 
-    # pivothigh/low(length, length): confirmed at bar i, refers to bar i-length
+    # Pivot confirmed at bar i refers to bar i-length.
     ph: list[Optional[float]] = [None] * n
     pl: list[Optional[float]] = [None] * n
     for i in range(2 * length, n):
@@ -540,10 +278,7 @@ def trendline_breakout_navigator(
     trend = 0
     have_u = have_l = False
     up_line = dn_line = None
-    # Anchor (pivot bar) of the currently-active upper/lower trendline, so the
-    # frontend can draw each as a single straight ray (anchor -> now) instead of
-    # a continuous zigzag through every historical pivot.
-    up_anchor_t = dn_anchor_t = None
+    # Anchor pivot of each active line, so the chart draws one straight ray per side.
     up_anchor_v = dn_anchor_v = None
     up_anchor_idx = dn_anchor_idx = None
     points = []
@@ -557,12 +292,12 @@ def trendline_breakout_navigator(
 
         if is_ph:
             upper, slope_ph, have_u = ph[i], s, True
-            up_anchor_t, up_anchor_v, up_anchor_idx = times[i - length], ph[i], i - length
+            up_anchor_v, up_anchor_idx = ph[i], i - length
         elif have_u:
             upper -= slope_ph
         if is_pl:
             lower, slope_pl, have_l = pl[i], s, True
-            dn_anchor_t, dn_anchor_v, dn_anchor_idx = times[i - length], pl[i], i - length
+            dn_anchor_v, dn_anchor_idx = pl[i], i - length
         elif have_l:
             lower += slope_pl
 
@@ -583,8 +318,7 @@ def trendline_breakout_navigator(
             signals.append({"time": times[i], "dir": "short"})
         trend_arr[i] = trend
 
-        # Break the line at each new pivot (like TradingView's color=na on pivot bar),
-        # so trendlines render as separate diagonal segments, not a connected zigzag.
+        # Gap at each new pivot so lines render as separate segments.
         points.append({
             "time": times[i],
             "upper": round(up_line, 2) if (up_line is not None and not is_ph) else None,
@@ -592,10 +326,7 @@ def trendline_breakout_navigator(
             "trend": trend,
         })
 
-    # Only the two CURRENTLY-active trendlines, each as a single straight ray from
-    # its anchor pivot to the latest bar. Emitting a value at every bar from the
-    # anchor onward (null before) renders one clean diagonal line per side — the
-    # LuxAlgo "Trendlines with Breaks" look — instead of a zigzag through history.
+    # The two currently-active lines as rays from their anchor to the latest bar.
     active = []
     for j in range(n):
         uv = (round(up_anchor_v - slope_ph * (j - up_anchor_idx), 2)
@@ -619,26 +350,13 @@ def trendline_breakout_navigator(
     }
 
 
-# =========================================================================== #
-#  Inversion Fair Value Gaps (IFVG) — LuxAlgo port
-#  © LuxAlgo — CC BY-NC-SA 4.0
-# =========================================================================== #
 def inverse_fvg(
     candles: list[dict],
     atr_multi: float = 0.25,
     wick: bool = False,
     disp_num: int = 8,
 ) -> Optional[dict]:
-    """
-    Python port of LuxAlgo's "Inversion Fair Value Gaps (IFVG)".
-
-    A normal FVG that gets closed through becomes an *inversion* zone (former
-    support flips to resistance and vice-versa). A signal fires when price
-    retests the inverted zone and breaks back through it:
-      - bullish FVG inverted -> resistance -> break below = BEARISH signal
-      - bearish FVG inverted -> support    -> break above = BULLISH signal
-    Returns per-bar signals, the active inversion zones, and the latest signal.
-    """
+    """FVGs closed through become inverted zones; a retest that breaks back through signals (bull FVG → short)."""
     n = len(candles)
     if n < 5:
         return None
@@ -647,7 +365,7 @@ def inverse_fvg(
     lo = [c["low"] for c in candles]
     cl = [c["close"] for c in candles]
     tm = [int(c["time"]) for c in candles]
-    atr = _atr(candles, min(200, max(n - 1, 14)))
+    atr = calc_atr(candles, min(200, max(n - 1, 14)))
 
     BUFFER = 100
     bull_fvg: list[dict] = []

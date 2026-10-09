@@ -62,8 +62,7 @@ export default function NewsBrief({ open, onToggle }: { open: boolean; onToggle:
     setLoading(true); setErr(null);
     try {
       const res = await getBrief(true);
-      // A configuration problem comes back as a 200 with `error`: show it, but still
-      // render whatever cached brief accompanied it.
+      // Config/refresh problems arrive as 200 + `error`; still show the cached brief.
       if (res.data?.brief) setBrief(res.data.brief);
       if (res.data?.error) setErr(res.data.error);
       else if (!res.data?.brief) setErr("Could not generate a brief — the AI returned nothing.");

@@ -18,8 +18,7 @@ function Empty({ msg }: { msg: string }) {
   return <div className="h-[220px] flex items-center justify-center text-gray-600 text-sm">{msg}</div>;
 }
 
-// Recharts defaults its tooltip label/item text to near-black, which is invisible on
-// this theme — every tooltip sets these explicitly.
+// Recharts' default near-black tooltip text is invisible on this theme.
 const tooltipStyle = {
   background: "#0d1117",
   border: "1px solid #30363d",

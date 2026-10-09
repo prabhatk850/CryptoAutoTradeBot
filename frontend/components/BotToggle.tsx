@@ -4,11 +4,7 @@ import { Play, Square, Loader2 } from "lucide-react";
 import clsx from "clsx";
 import { startBot, stopBot, getBotStatus } from "../lib/api";
 
-/**
- * Single Start/Stop toggle for the header (sits next to the coin switch).
- * Green "Start" when stopped, red "Stop" when running. Stop is locked while a
- * position is open (the bot must close it first) — same guard as before.
- */
+/** Header Start/Stop toggle; Stop is locked while a position is open. */
 export default function BotToggle({ openPosition = 0 }: { openPosition?: number }) {
   const [status, setStatus] = useState<any>(null);
   const [loading, setLoading] = useState(false);

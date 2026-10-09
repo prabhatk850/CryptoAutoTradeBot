@@ -1,10 +1,4 @@
-# Keeps the ForexBot backend running 24/7.
-# Restarts automatically if it ever crashes. The bot auto-starts on boot
-# (AUTO_START_BOT=true), so trading resumes after any restart.
-#
-# Run manually:   powershell -ExecutionPolicy Bypass -File run_backend.ps1
-# Or register it to start at login (see scripts/README.md).
-
+# Runs the backend outside Docker and restarts it if it crashes (see scripts/README.md).
 $ErrorActionPreference = "Continue"
 $backend = Join-Path $PSScriptRoot "..\backend"
 $python  = Join-Path $backend "venv\Scripts\python.exe"

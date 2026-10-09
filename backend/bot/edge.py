@@ -1,12 +1,4 @@
-"""
-Backtested "edge" per strategy, per symbol.
-
-Runs the backtest on CLEAN mark-price candles (free of testnet fill slippage) to
-measure each strategy's real profit-factor / expectancy, and caches it. This becomes
-an evidence-based PRIOR the AI brain uses to weight the live strategy votes — so the
-LLM trusts signals that have actually made money on THIS symbol and discounts the ones
-that haven't. Refreshes on a slow cadence (edge changes slowly).
-"""
+"""Per-strategy backtested edge on mark candles — the prior for AI vote weighting and the expectancy gate."""
 import asyncio
 import logging
 import time
@@ -18,13 +10,12 @@ from config import settings
 logger = logging.getLogger("bot.edge")
 _delta = DeltaClient()
 _cache: dict[str, tuple[float, dict]] = {}   # symbol -> (ts, edge)
-_TTL = 6 * 3600      # recompute at most every 6h
+_TTL = 6 * 3600
 _BARS = 1500
 
 
 async def get_edge(symbol: str) -> dict:
-    """{strategy_id: {"pf": profit_factor, "exp": expectancy_R, "n": trades}} on mark data.
-    Cached per symbol; returns {} (or last good) if it can't compute."""
+    """{strategy: {pf, exp, n}}, cached 6h; last good (or {}) on failure."""
     sym = symbol.upper()
     now = time.time()
     cached = _cache.get(sym)
@@ -50,13 +41,7 @@ async def get_edge(symbol: str) -> dict:
 
 
 async def blended_expectancy(symbol: str, votes: dict, action: str, weights: dict | None = None) -> dict:
-    """Weight-average the backtested expectancy/PF of every strategy that voted
-    `action`, using only strategies with enough backtested trades to trust.
-
-    This is the evidence behind the pre-trade "is this actually profitable" gate —
-    it reuses the same cached backtested edge the AI snapshot already trusts,
-    rather than inventing a second notion of what "works" means.
-    """
+    """Weighted backtested expectancy/PF of the strategies voting `action` (only those with enough trades)."""
     weights = weights or {}
     edge = await get_edge(symbol)
     w_sum = exp_sum = pf_sum = 0.0

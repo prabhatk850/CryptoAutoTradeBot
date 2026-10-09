@@ -1,198 +1,120 @@
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Project root .env (one level above /backend) so it loads no matter the CWD.
+# Project-root .env, so it loads regardless of CWD.
 _ROOT_ENV = Path(__file__).resolve().parent.parent / ".env"
 
 
 class Settings(BaseSettings):
+    # --- Exchange / DB ---
     delta_api_key: str = ""
     delta_api_secret: str = ""
     delta_base_url: str = "https://cdn-ind.testnet.deltaex.org"
-
     mongo_uri: str = "mongodb://localhost:27017/forexbot"
 
-    trading_symbol: str = "BTCUSD"   # default/primary symbol (chart default)
-    # Chart + analysis candles use the index-derived MARK price, not the thin
-    # last-traded price. On the demo/testnet the traded feed prints fake wicks to
-    # stale levels; mark-price candles are smooth and match the real market.
-    use_mark_candles: bool = True
-    # Symbols the bot actively trades SIMULTANEOUSLY (each opens + manages its own).
-    trade_symbols: str = "BTCUSD,ETHUSD"
-    max_concurrent_positions: int = 2  # cap total open positions across all coins
-    trade_quantity: int = 1
-    check_interval_minutes: int = 5
-    # Deep-analysis cadence. When > 0 this WINS over check_interval_minutes.
-    # 120s matches how long a full 2-symbol Ox Alpha tick actually takes, so the
-    # scheduler stops firing ticks that only get dropped as overlapping.
-    check_interval_seconds: int = 120
+    # --- Symbols & cadence ---
+    trading_symbol: str = "BTCUSD"             # dashboard's default chart symbol
+    trade_symbols: str = "BTCUSD,ETHUSD"       # symbols the bot opens trades on
+    use_mark_candles: bool = True              # mark-price candles (testnet traded feed prints fake wicks)
+    max_concurrent_positions: int = 2
+    check_interval_minutes: int = 5            # deep-loop cadence when check_interval_seconds is 0
+    check_interval_seconds: int = 120          # deep-loop cadence; wins over minutes when > 0
+    auto_start_bot: bool = True                # start trading when the backend boots
+    candle_limit: int = 500                    # candles fetched per timeframe per tick
 
-    # --- Fast execution loop -------------------------------------------------- #
-    # The deep loop decides WHAT to trade; this loop decides WHEN, so a setup that
-    # ripens between deep ticks is not entered (or exited) up to 2 minutes late.
-    # It runs only for symbols the deep tick ARMED, uses FAST_PROVIDERS (Groq /
-    # Gemini — never Ox Alpha, never the subscription), and never analyses from
-    # scratch: it re-checks the armed trigger against a live price.
+    # --- Fast execution loop (fires armed triggers between deep ticks) ---
     fast_check_enabled: bool = True
     fast_check_seconds: int = 15
-    # Arm when the distance from price to the trigger is within this multiple of
-    # the move the market is expected to make before the next deep tick (derived
-    # from 5m ATR). 1.0 = "reachable at current volatility"; raise to arm sooner.
-    fast_arm_atr_mult: float = 1.2
-    # An armed watch expires after this many seconds if the deep loop never renews
-    # it, so a stale trigger can never fire on old analysis.
-    fast_arm_ttl_sec: int = 300
-    # Minimum strategies that must agree (on the entry timeframe) to trade.
-    min_signals: int = 2
-    # Multi-timeframe: 1h sets bias, 15m is the DECISION timeframe (votes + entry),
-    # 5m is analyzed for entry timing/confirmation only (never the decision TF).
-    trend_timeframe: int = 60    # 1h — sets allowed direction (bias)
-    entry_timeframe: int = 15    # 15m — the timeframe trades are decided on
-    ltf_timeframe: int = 5       # 5m — lower timeframe analyzed for entry timing
-    # Auto-start the trading bot when the backend boots (survives restarts).
-    auto_start_bot: bool = True
-    # Comma-separated strategy ids to vote on each trade. Add new ones here.
-    # Options: EMA_CROSS, RSI, BREAKOUT, SUPERTREND_AI, TRENDLINE_NAV
+    fast_arm_atr_mult: float = 1.2             # arm if trigger is within this × expected move
+    fast_arm_ttl_sec: int = 300                # armed watch expires after this
+
+    # --- Timeframes & voting ---
+    trend_timeframe: int = 60                  # 1h sets direction bias
+    entry_timeframe: int = 15                  # 15m is the decision timeframe
+    ltf_timeframe: int = 5                     # 5m refines entry timing only
+    min_signals: int = 2                       # strategies that must agree to trade
     strategies: str = "EMA_CROSS,RSI,BREAKOUT,SUPERTREND_AI,TRENDLINE_NAV,FVG,IFVG,SMC,MACD"
-    # Trendline Navigator swing term: Long / Medium / Short (Short = most responsive).
-    trendline_term: str = "Medium"
-    # Candles fetched per tick (needs enough history for long-swing indicators).
-    candle_limit: int = 500
+    shadow_strategies: str = "FUNDING_BIAS,ORDERBOOK_IMBALANCE"  # tracked, never vote
+    fvg_min_pct: float = 0.6                   # hide chart FVG zones smaller than this % of price
 
-    # --- Risk / sizing (CAPITAL-BASED: each trade deploys a fixed % of capital as margin) ---
-    leverage: int = 50                 # margin leverage (max; auto-lowered so SL stays inside liquidation)
-    position_capital_pct: float = 50.0 # normal trade: use this % of balance as margin
-    big_trade_capital_pct: float = 20.0# "big" trade (strong confluence): smaller margin -> fewer lots
-    big_trade_min_agree: float = 0.7   # fraction of enabled strategies that must agree for a big trade
-    liq_buffer_pct: float = 0.5        # SL must sit at least this % of price INSIDE the liquidation price
-    risk_min_pct: float = 0.5          # (legacy risk-based knobs, kept for fallback symbols)
+    # --- Risk / sizing (margin = fixed % of capital) ---
+    leverage: int = 50                         # max; auto-lowered so SL sits inside liquidation
+    position_capital_pct: float = 50.0         # margin for a normal trade
+    big_trade_capital_pct: float = 20.0        # margin for a high-confluence trade (wider SL/TP)
+    big_trade_min_agree: float = 0.7           # fraction of strategies agreeing to count as "big"
+    liq_buffer_pct: float = 0.5                # SL must be this % of price inside liquidation
+    risk_min_pct: float = 0.5                  # risk band shown to the AI
     risk_max_pct: float = 1.5
-    margin_cap_pct: float = 0.5        # never use more than 50% of *available* balance as margin on ONE trade
-    stop_loss_pct: float = 1.0         # fallback stop distance (%) if no SL candidate
-    risk_reward: float = 2.0           # FLOOR reward:risk (never below 1:2)
-    # --- Per-symbol POINT limits (ETH). Normal trades are tight; "big" trades widen SL/TP. ---
+    margin_cap_pct: float = 0.5                # max fraction of available balance per trade
+    stop_loss_pct: float = 1.0                 # fallback stop distance when no SL candidate exists
+    risk_reward: float = 2.0                   # minimum reward:risk floor
+    daily_loss_limit_pct: float = 10.0         # stop new entries after this daily realized loss (0 = off)
+    # ETH uses point-based SL/TP bands instead of percentages.
     eth_sl_min_pts: float = 5.0
-    eth_sl_max_pts: float = 20.0       # normal ETH stop: at most 20 points
-    eth_tp_min_pts: float = 50.0       # normal ETH target band: 50–60 points
+    eth_sl_max_pts: float = 20.0
+    eth_tp_min_pts: float = 50.0
     eth_tp_max_pts: float = 60.0
-    eth_big_sl_max_pts: float = 60.0   # big ETH trade: wider stop
-    eth_big_tp_min_pts: float = 120.0  # big ETH trade: larger target
+    eth_big_sl_max_pts: float = 60.0
+    eth_big_tp_min_pts: float = 120.0
     eth_big_tp_max_pts: float = 220.0
-    # Circuit breaker: stop opening NEW trades once today's realized loss reaches this
-    # % of account (existing positions keep their exchange SL/TP). 0 disables.
-    daily_loss_limit_pct: float = 10.0
-    # --- Stop-loss placement (combined ATR + SuperTrend + structure) ---
-    atr_period: int = 14
-    atr_k: float = 1.5                 # ATR-based stop = entry +/- k*ATR
-    sl_lookback: int = 20              # bars for structure swing (entry TF)
-    min_sl_pct: float = 0.3            # clamp stop distance to >= this % of price
-    max_sl_pct: float = 1.5            # clamp stop distance to <= this % of price (no big stops)
-    target_lookback: int = 30          # 1h bars used for the 1:2 feasibility check
-    # --- Partial take-profits + breakeven ---
-    # Never more than 2 TPs. Set max_tps=1 for a single target (tp_splits="1.0").
-    max_tps: int = 2
-    tp_splits: str = "0.5,0.5"         # close 50% at TP1, 50% at TP2 (2 TPs)
-    move_be_after_tp: int = 1          # move SL to breakeven after TP{n} fills (1 = after TP1)
-    # Only show FVG / IFVG zones on the chart whose height is >= this % of price.
-    fvg_min_pct: float = 0.6
-    # --- Auto-tune: weight each strategy's vote by its live performance ---
-    autotune_enabled: bool = True
-    autotune_min_trades: int = 8     # need this many attributed trades before weighting a strategy
-    autotune_gain: float = 0.6       # how strongly expectancy (R) shifts the weight
-    weight_min: float = 0.3          # a strategy's vote can shrink to this
-    weight_max: float = 2.0          # ...or grow to this
 
-    # --- AI brain: an LLM analyzes the chart each tick and sets entry/SL/TP ---
-    # Trading provider priority: Gemini (GEMINI_API_KEY) → Anthropic API
-    # (ANTHROPIC_API_KEY) → local Claude Code CLI → mechanical engine.
-    # The news brief is Claude-only (Anthropic API → CLI) — see news.get_brief().
-    # Groq was removed deliberately; leftover GROQ_* env vars are ignored.
-    # --- OpenRouter / Ox Alpha: FIRST rung for all AI work ------------------- #
-    # oxalpha.site is only a tracker page; the model itself is served by OpenRouter
-    # as `stealth/ox-alpha` — free ($0 in/out), 1M context, OpenAI-compatible.
-    # It is a STEALTH model: the provider is anonymous, there is no SLA, and it can
-    # be withdrawn without notice — hence it leads a chain rather than replacing it.
+    # --- Stop-loss & take-profit placement ---
+    atr_period: int = 14
+    atr_k: float = 1.5                         # ATR stop = entry ± k·ATR
+    sl_lookback: int = 20                      # bars for the structure stop
+    min_sl_pct: float = 0.3                    # stop distance clamp, % of price
+    max_sl_pct: float = 1.5
+    target_lookback: int = 30                  # 1h bars checked for room to a 1:2 target
+    max_tps: int = 2                           # at most this many take-profits
+    tp_splits: str = "0.5,0.5"                 # size split across TPs
+
+    # --- Auto-tune (weight votes by live expectancy) ---
+    autotune_enabled: bool = True
+    autotune_min_trades: int = 8               # trades needed before a strategy is reweighted
+    autotune_gain: float = 0.6                 # weight = 1 + gain × expectancy(R)
+    autotune_use_mark_pnl: bool = True         # train on mark→mark P/L, not fills
+    weight_min: float = 0.3
+    weight_max: float = 2.0
+
+    # --- AI brain: providers (chains live in bot/ai_brain.py) ---
+    ai_enabled: bool = True
+    ai_mode: str = "decide"                    # decide | refine (AI sets SL/TP only) | advisory
+    ai_model: str = "claude-sonnet-5"          # model for the `cli` rung
+    ai_min_confidence: float = 0.55            # below this an AI trade becomes HOLD
+    ai_timeout_sec: int = 150
+    ai_respect_trend_filter: bool = True       # block AI trades against the 1h trend
+    ai_allow_subscription_cli: bool = False    # never spend the personal Claude subscription
+    subscription_cli_daily_call_cap: int = 200
+    claude_cli_path: str = ""                  # blank = auto-discover
+    # OpenRouter (Ox Alpha: free stealth model, may vanish without notice)
     openrouter_api_key: str = ""
     openrouter_model: str = "stealth/ox-alpha"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_max_output_tokens: int = 4096
-    # Sent as OpenRouter attribution headers (optional, but good manners).
     openrouter_referer: str = "https://github.com/local/forex-bot"
     openrouter_title: str = "forex-bot"
-
-    # --- Groq: SECOND rung. Fastest and cheapest, so it absorbs the routine
-    # 5-minute ticks before anything metered or subscription-backed is touched.
-    # NOTE: llama-3.3-70b-versatile was decommissioned by Groq (404) — that is why
-    # this provider went dark. Use a model that is live on the account.
+    # Groq (fast; free tier 413s on the full deep snapshot)
     groq_api_key: str = ""
     groq_model: str = "openai/gpt-oss-120b"
     groq_base_url: str = "https://api.groq.com/openai/v1"
     groq_max_output_tokens: int = 4096
+    # Gemini (flash for trading, pro for the news brief; use -latest aliases)
     gemini_api_key: str = ""
-    # Two-tier Gemini. FLASH runs the 5-minute trading loop (288 calls/day — Pro there
-    # would be slow and expensive). PRO runs the news brief, which is manual and
-    # low-frequency, so it's where deeper reasoning actually pays for itself.
-    # Pro falls through to Flash automatically if it errors or is out of quota.
-    # Versioned names (gemini-2.5-flash) 404 for newer keys — use the `-latest` aliases.
     gemini_model: str = "gemini-flash-latest"
     gemini_pro_model: str = "gemini-pro-latest"
-    # Thinking tokens for 2.5-class models: 0 = off, -1 = dynamic, or a fixed budget.
-    # ~8k is the middle ground — enough for multi-step reasoning without paying for
-    # pro-tier deliberation on every 5-minute tick.
-    gemini_thinking_budget: int = 8192
-    # Thinking tokens are billed as output and count toward maxOutputTokens, so the
-    # cap must leave room for the answer ON TOP of the budget.
-    gemini_max_output_tokens: int = 4096
-    anthropic_api_key: str = ""
-    # --- AgentRouter (Claude reseller, https://agentrouter.org) --------------- #
-    # Anthropic-compatible, but it authenticates ONLY Claude-Code-style clients:
-    # the Python SDK is rejected with `unauthorized_client_error`, so this is
-    # reachable exclusively through the CLI path. ai_brain injects these into the
-    # `claude -p` subprocess, which keeps them out of interactive Claude Code
-    # sessions — those stay on the subscription and act as the final fallback.
+    gemini_thinking_budget: int = 8192         # 0 = off, -1 = dynamic
+    gemini_max_output_tokens: int = 4096       # answer budget on top of thinking tokens
+    # AgentRouter (Claude reseller, CLI-only, ~$0.28/call)
     agentrouter_api_key: str = ""
     agentrouter_base_url: str = "https://agentrouter.org"
-    # This token can only reach claude-opus-5 and claude-opus-4-8.
     agentrouter_model: str = "claude-opus-4-8"
-    # Spend guard. A headless CLI call costs ~$0.28, so on a 30-SECOND loop
-    # (2,880 ticks/day) an outage of the free rungs would burn ~$800/day and empty
-    # the balance in minutes. Once this many router calls have been made in a UTC
-    # day the rung is skipped and the chain moves on. 0 disables the cap.
-    agentrouter_daily_call_cap: int = 120
-    # Hard switch for the LAST rung. The Docker override mounts ~/.claude into the
-    # container, so the `cli` provider spends the personal Claude subscription.
-    # Set false to make the bot fail over to the mechanical engine instead of ever
-    # touching it — the chain then ends at AgentRouter.
-    # OFF by default: the trading bot runs only on user-supplied keys. No chain in
-    # ai_brain routes to `cli`, and this is the belt that keeps it that way even if
-    # one is added back by accident.
-    ai_allow_subscription_cli: bool = False
-    # Second belt on the same rung. Ox Alpha's daily ceiling is undocumented, so if
-    # it 429s mid-day a 30s loop (5,760 calls/day across 2 symbols) could pour
-    # thousands of calls into the personal subscription. Stop at this many per UTC
-    # day and fall to the mechanical engine instead. 0 disables the cap.
-    subscription_cli_daily_call_cap: int = 200
-    ai_enabled: bool = True
-    ai_model: str = "claude-sonnet-5"   # claude-sonnet-5 / claude-sonnet-5-6 / claude-haiku-5-20251001
-    # decide  = AI picks direction + SL + TP (guardrails enforce risk); this is the default
-    # refine  = strategy votes decide direction, AI only sets smarter SL/TP
-    # advisory = AI analysis is logged/shown but the mechanical engine still trades
-    ai_mode: str = "decide"
-    ai_min_confidence: float = 0.55     # below this the AI's trade is skipped (HOLD)
-    ai_timeout_sec: int = 150           # max seconds to wait for a Claude response
-    # Leave blank to auto-discover the Claude Code binary; set to override.
-    claude_cli_path: str = ""
-    ai_respect_trend_filter: bool = True  # still block trades that fight the 1h trend
+    agentrouter_daily_call_cap: int = 120      # spend guard per UTC day (0 = uncapped)
 
-    # --- Market news + economic calendar ------------------------------------ #
-    # ForexFactory has no public news API, so headlines are aggregated from forex/
-    # crypto RSS feeds; the "forecast" table uses FF's official weekly calendar JSON.
+    # --- News & economic calendar ---
     news_enabled: bool = True
+    news_ai_context: bool = True               # feed news + events into the AI snapshot
     news_calendar_url: str = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-    # Comma-separated `Name|url` RSS feeds (name optional). Fetched concurrently; any
-    # that fail are skipped. NOTE: The Block (theblock.co) is deliberately absent — it
-    # answers 403 to all server-side requests regardless of user-agent.
-    news_feeds: str = (
+    news_feeds: str = (                        # `Name|url` RSS feeds (theblock.co 403s, omitted)
         "ForexLive|https://www.forexlive.com/feed/news,"
         "FXStreet|https://www.fxstreet.com/rss/news,"
         "Investing|https://www.investing.com/rss/news_1.rss,"
@@ -204,64 +126,33 @@ class Settings(BaseSettings):
         "CryptoSlate|https://cryptoslate.com/feed/,"
         "Bitcoin.com|https://news.bitcoin.com/feed/"
     )
-    # Currencies the bot *reacts* to: the AI snapshot and the trading blackout only
-    # consider events for these (always keep USD — it drives DXY & crypto). The
-    # dashboard calendar shows the full ForexFactory week regardless of this list.
-    news_currencies: str = "USD,EUR,GBP,JPY,CNY"
-    news_refresh_sec: int = 180      # cache TTL for headline fetches
-    # Calendar changes weekly, and its host rate-limits frequent polling — cache it long.
-    news_calendar_refresh_sec: int = 900   # 15 min
-    # Public Telegram channels, comma-separated `Name|handle` (name optional).
-    # Read via each channel's public web preview (t.me/s/<handle>) — no bot token and
-    # no user session. A Telegram BOT cannot read channels it doesn't administer, so
-    # the preview is the only credential-free way to follow third-party channels.
-    telegram_channels: str = "LMWM News|lmwmnews"
-    telegram_max_posts: int = 60     # cap the merged channel timeline
-    news_max_stories: int = 90       # cap the merged headline list (10 feeds now)
-    news_brief_ttl_sec: int = 900    # cached AI brief lifetime (manual refresh overrides)
-    news_ai_context: bool = True     # inject news + upcoming events into the AI snapshot
-    news_lookahead_hours: float = 24.0  # how far ahead a High-impact event counts as "upcoming"
-    # Safety blackout: skip opening NEW trades within this many minutes (before OR after)
-    # of a High-impact event for a relevant currency. 0 disables. Open positions keep SL/TP.
-    news_blackout_min: int = 15
+    telegram_channels: str = "LMWM News|lmwmnews"  # `Name|handle`, read via public t.me/s preview
+    news_currencies: str = "USD,EUR,GBP,JPY,CNY"   # currencies the AI and blackout react to
+    news_refresh_sec: int = 180
+    news_calendar_refresh_sec: int = 900       # calendar host rate-limits; cache long
+    news_brief_ttl_sec: int = 900
+    news_max_stories: int = 90
+    telegram_max_posts: int = 60
+    news_lookahead_hours: float = 24.0         # window for "upcoming" high-impact events
+    news_blackout_min: int = 15                # no new entries ± this many min of a high-impact event
 
-    # Manual close guard: refuse (pending confirmation) a market close whose real fill
-    # is further than this from the mark price. The testnet book is often one-sided,
-    # so an unguarded market close can turn a mark-profit into a real loss.
-    close_max_slippage_pct: float = 0.5
-    # Liquidity gates checked before EVERY entry. Never enter a market you cannot exit:
-    # a wide book eats the edge on the way in, and an empty one traps the position.
-    max_entry_spread_pct: float = 0.15    # quoted bid/ask spread vs mark
-    max_exit_slippage_pct: float = 0.40   # cost of closing the intended size
-    # Master switch + mode for the liquidity gate. "shadow" runs the check and logs
-    # what it WOULD have done without ever blocking a trade — use this first to see
-    # real block-rate data (ETH's testnet book is sometimes empty) before "enforce".
+    # --- Execution guards ---
+    close_max_slippage_pct: float = 0.5        # manual close asks to confirm beyond this slippage
+    max_entry_spread_pct: float = 0.15
+    max_exit_slippage_pct: float = 0.40
     liquidity_gate_enabled: bool = True
-    liquidity_gate_mode: str = "shadow"   # "off" | "shadow" | "enforce"
+    liquidity_gate_mode: str = "shadow"        # off | shadow (log only) | enforce
+    expectancy_gate_enabled: bool = True       # require backtested edge for the voting strategies
+    expectancy_gate_min_R: float = -0.1
+    expectancy_gate_min_strategy_n: int = 15   # backtested trades before a strategy's edge counts
+    expectancy_gate_fail_open: bool = True     # allow trades when no strategy qualifies yet
 
-    # Pre-trade expectancy/profitability gate: require the strategies backing the
-    # proposed action to have REAL backtested edge on this symbol (from bot/edge.py)
-    # before committing capital — not just "enough strategies agree".
-    expectancy_gate_enabled: bool = True
-    # The original +0.05 (demand a margin ABOVE breakeven) blocked ~100% of
-    # BTCUSD/ETHUSD entries for 24h+ live — the persistent blocked case measured
-    # -0.056R, which is only mildly negative, not a clearly-bad setup. -0.1 blocks
-    # setups with a real demonstrated negative edge while letting near-breakeven
-    # ones (which is most real setups here; PFs cluster ~0.96-1.19) through.
-    expectancy_gate_min_R: float = -0.1        # min blended backtested expectancy (R) required
-    expectancy_gate_min_strategy_n: int = 15   # backtested trades needed before a strategy's edge counts
-    expectancy_gate_fail_open: bool = True     # allow the trade when there's no qualifying evidence yet
-    # Train the strategy tuner on mark→mark P/L (the DECISION) rather than on fills
-    # (the VENUE). Set false only on a venue whose fills you trust completely.
-    autotune_use_mark_pnl: bool = True
-
+    # --- Indicators ---
     ema_fast: int = 9
     ema_slow: int = 21
     rsi_period: int = 14
     rsi_oversold: float = 30.0
     rsi_overbought: float = 70.0
-
-    # --- New indicators: Bollinger/Keltner squeeze, ADX, VWAP -------------------- #
     bb_period: int = 20
     bb_mult: float = 2.0
     kc_period: int = 20
@@ -269,38 +160,34 @@ class Settings(BaseSettings):
     kc_atr_len: int = 10
     adx_period: int = 14
     vwap_enabled: bool = True
-
-    # ADX trend-strength GATE (global filter, not a vote): ranging markets (low ADX)
-    # get no trend-following edge, so block entries there. Off by default until
-    # backtest-validated per symbol (see GET /bot/backtest COMBINED_ADX_GATED).
-    adx_gate_enabled: bool = False
-    adx_min_trend: float = 20.0   # standard Wilder no-trend threshold
-
-    # Divergence swing detection (RSI vs price at swing points).
+    adx_gate_enabled: bool = False             # block entries when 1h ADX is below adx_min_trend
+    adx_min_trend: float = 20.0
     divergence_swing_left: int = 2
     divergence_swing_right: int = 2
 
-    # --- Crypto-native strategies, shadow-mode validated (never influence real
-    # trades until proven positive-expectancy live — see GET /bot/performance/shadow) --- #
-    shadow_strategies: str = "FUNDING_BIAS,ORDERBOOK_IMBALANCE"
+    # --- Crypto-native shadow signals ---
     funding_history_window_days: int = 30
     funding_min_history_samples: int = 20
-    funding_extreme_percentile: float = 0.90   # >=90th / <=10th percentile = "extreme"
+    funding_extreme_percentile: float = 0.90
     ob_imbalance_levels: int = 10
-    ob_imbalance_threshold: float = 0.35       # |bid-ask skew| beyond this casts a vote
+    ob_imbalance_threshold: float = 0.35
 
-    # --- Portfolio-level risk: correlation-aware sizing + volatility-adjusted sizing --- #
+    # --- Portfolio risk ---
     correlation_check_enabled: bool = True
     correlation_lookback_bars: int = 200
     correlation_timeframe_min: int = 60
     correlation_high_threshold: float = 0.7
-    correlation_dampen_factor: float = 0.5     # cap_pct multiplier when highly correlated & same direction
-
-    vol_sizing_enabled: bool = False           # off by default — changes real sizing math
-    vol_ref_atr_pct: float = 0.5               # "normal" ATR% of price this sizing is calibrated to
+    correlation_dampen_factor: float = 0.5     # margin multiplier for a correlated same-side trade
+    vol_sizing_enabled: bool = False           # scale margin inversely with ATR%
+    vol_ref_atr_pct: float = 0.5
     vol_scalar_min: float = 0.4
     vol_scalar_max: float = 1.5
 
     model_config = SettingsConfigDict(env_file=str(_ROOT_ENV), extra="ignore")
+
+    def symbols(self) -> list[str]:
+        """trade_symbols as a clean upper-case list."""
+        return [s.strip().upper() for s in self.trade_symbols.split(",") if s.strip()]
+
 
 settings = Settings()

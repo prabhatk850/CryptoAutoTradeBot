@@ -1,25 +1,11 @@
-"""
-Smart Money Concepts (SMC) detection engine.
-
-Computes the structural facts an SMC trader looks for — deterministically, from
-candles — so the AI brain reasons over real levels instead of hallucinating them:
-
-  • Market structure   — swing points labelled HH / HL / LH / LL  → trend
-  • BOS vs CHoCH       — break of structure (continuation) vs change of character (reversal)
-  • Liquidity          — equal highs/lows, prev-day high/low, swing pools (buy/sell-side)
-  • Liquidity sweep    — wick beyond a level that closes back (stop hunt)
-  • Order blocks       — last opposing candle before an impulsive, structure-breaking move
-  • Premium / Discount — fib equilibrium (50%) + OTE zone of the current dealing range
-
-`analyze(candles)` bundles everything into one compact, model-friendly dict.
-"""
+"""Smart Money Concepts read from candles: structure, BOS/CHoCH, liquidity, sweeps, order blocks, premium/discount."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Optional
 
-from bot.lux_indicators import _atr
-from bot.swings import find_swings as _swings
+from bot.indicators import calc_atr
+from bot.swings import find_swings
 
 
 def _label(swings: list[dict]) -> list[dict]:
@@ -54,7 +40,7 @@ def _trend(labeled: list[dict]) -> str:
     return "ranging"
 
 
-def _breaks(candles: list[dict], swings: list[dict]) -> list[dict]:
+def breaks(candles: list[dict], swings: list[dict]) -> list[dict]:
     """Scan closes against the standing swing high/low to emit BOS / CHoCH events."""
     events: list[dict] = []
     trend = 0  # +1 up, -1 down
@@ -171,13 +157,13 @@ def analyze(candles: list[dict], atr_period: int = 14) -> Optional[dict]:
     if not candles or len(candles) < 25:
         return None
     price = candles[-1]["close"]
-    atr_list = _atr(candles, atr_period)
+    atr_list = calc_atr(candles, atr_period)
     atr = atr_list[-1] if atr_list else max(price * 0.002, 1.0)
 
-    swings = _swings(candles)
+    swings = find_swings(candles)
     labeled = _label(swings)
     trend = _trend(labeled)
-    breaks = _breaks(candles, swings)
+    brks = breaks(candles, swings)
 
     tol = max(atr * 0.15, price * 0.0006)
     highs = [s["price"] for s in swings if s["kind"] == "high"]
@@ -194,21 +180,13 @@ def analyze(candles: list[dict], atr_period: int = 14) -> Optional[dict]:
     return {
         "trend": trend,
         "swings": [{"label": s["label"], "price": s["price"], "kind": s["kind"], "time": s["time"]} for s in labeled[-8:]],
-        "structure_break": (breaks[-1] and {k: breaks[-1][k] for k in ("type", "dir", "level", "time")}) if breaks else None,
+        "structure_break": {k: brks[-1][k] for k in ("type", "dir", "level", "time")} if brks else None,
         "liquidity": {
             "buyside": buyside, "sellside": sellside,
             "equal_highs": equal_highs[-3:], "equal_lows": equal_lows[-3:],
             "prev_day_high": pdh, "prev_day_low": pdl,
         },
         "recent_sweep": _sweep(candles, up_levels, dn_levels),
-        "order_blocks": _order_blocks(candles, breaks, price, atr),
+        "order_blocks": _order_blocks(candles, brks, price, atr),
         "premium_discount": _premium_discount(swings, price),
     }
-
-
-def bias(smc: Optional[dict]) -> int:
-    """Coarse directional read for a strategy vote: +1 bullish / -1 bearish / 0 neutral."""
-    if not smc:
-        return 0
-    t = smc.get("trend")
-    return 1 if t == "bullish" else -1 if t == "bearish" else 0

@@ -1,5 +1,4 @@
-# Node comes from the official image rather than apt so the Claude Code CLI gets a
-# version it supports; only the runtime + npm are copied, not the whole image.
+# Node runtime (for the Claude Code CLI used by the AgentRouter rung) copied from the official image.
 FROM node:20-slim AS node
 
 FROM python:3.12-slim

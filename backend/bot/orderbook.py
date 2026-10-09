@@ -1,11 +1,4 @@
-"""
-L2 order-book imbalance: bid/ask volume skew near the top of book.
-
-Pure calculation over a book already fetched for other purposes (get_orderbook is
-also used by the liquidity gate's exit-slippage check) — no extra API call needed.
-A short-horizon (seconds-to-minutes) signal; kept low-conviction wherever it votes
-since the decision cadence it feeds (15m) is much slower than the signal's horizon.
-"""
+"""Top-of-book bid/ask volume skew — a seconds-scale signal, shadow-only."""
 from __future__ import annotations
 from typing import Optional
 
@@ -13,8 +6,7 @@ from config import settings
 
 
 def imbalance(book: dict, levels: Optional[int] = None) -> Optional[dict]:
-    """{"imb": -1..1, "signal": BUY|SELL|NEUTRAL, "top_bid", "top_ask", "spread_pct"}
-    or None if the book is empty/unusable. imb > 0 means bid-heavy (buy pressure)."""
+    """imb in -1..1 (> 0 = bid-heavy) with a BUY/SELL/NEUTRAL signal, or None for an unusable book."""
     levels = levels or settings.ob_imbalance_levels
     bids, asks = (book or {}).get("buy") or [], (book or {}).get("sell") or []
     if not bids or not asks:

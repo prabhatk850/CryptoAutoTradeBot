@@ -1,24 +1,4 @@
-"""
-Market news + economic calendar (real-time).
-
-Two independent, in-process cached sources:
-
-  • Economic calendar — ForexFactory's official weekly JSON (served via FairEconomy):
-    each event carries currency, impact (High/Medium/Low), forecast and previous.
-    This is the "forecast" table shown on the dashboard.
-
-  • News headlines — ForexFactory has no public API, so we aggregate the same kind of
-    real-time forex/macro/crypto headlines from several established RSS feeds
-    (ForexLive, FXStreet, Investing.com, Cointelegraph). Merged, de-duplicated,
-    newest-first, HTML/images stripped.
-
-It also exposes:
-  • ai_context()  — a compact news+events block injected into the AI snapshot each tick.
-  • in_blackout() — a guardrail the scheduler uses to skip opening NEW trades in the
-    window around a High-impact release.
-
-No extra dependencies: httpx (already used) + stdlib XML/date parsing.
-"""
+"""News headlines (RSS), public Telegram channels, ForexFactory calendar, the AI day brief, and the trading blackout."""
 from __future__ import annotations
 
 import asyncio
@@ -42,23 +22,11 @@ _UA = "Mozilla/5.0 (compatible; ForexBot/1.0)"
 _ATOM = "{http://www.w3.org/2005/Atom}"
 IMPACT_RANK = {"high": 3, "medium": 2, "low": 1, "holiday": 0, "": 0}
 
-# in-process caches: {"data": [...], "ts": epoch_seconds}
-# `hydrated` tracks whether we've already tried to reload this cache from Mongo.
-_news_cache: dict = {"data": [], "ts": 0.0, "hydrated": False}
-_cal_cache: dict = {"data": [], "ts": 0.0, "hydrated": False}
-_tg_cache: dict = {"data": [], "ts": 0.0, "hydrated": False}
-_news_lock = asyncio.Lock()
-_cal_lock = asyncio.Lock()
-_tg_lock = asyncio.Lock()
+# In-process caches, mirrored to Mongo so a restart serves data without refetching rate-limited hosts.
+_caches: dict[str, dict] = {k: {"data": [], "ts": 0.0, "hydrated": False, "lock": asyncio.Lock()}
+                            for k in ("news", "calendar", "telegram")}
 
-# Both upstreams rate-limit hard (the calendar host answers 429 to rapid refetches),
-# so an in-process-only cache means every backend restart can leave the dashboard
-# empty for minutes. Mirroring the last good payload into Mongo makes a restart
-# serve data immediately and, because the persisted timestamp comes back too, usually
-# avoids refetching at all.
-_CACHE_KEYS = {"news": _news_cache, "calendar": _cal_cache, "telegram": _tg_cache}
-
-# --- light, risk/crypto-oriented tone lexicon (display accent + a gentle AI hint) --- #
+# Rough headline tone (display accent + a gentle AI hint).
 _BULL = {
     "surge", "surges", "soar", "soars", "rally", "rallies", "jump", "jumps", "gains",
     "rise", "rises", "climb", "climbs", "beat", "beats", "bullish", "record high",
@@ -90,7 +58,7 @@ def _clean(text: Optional[str], limit: int = 220) -> str:
 
 
 def _parse_date(s: Optional[str]) -> Optional[datetime]:
-    """Parse RFC-822 (RSS), ISO-8601 (Atom / FF calendar), or 'YYYY-MM-DD HH:MM:SS'."""
+    """RFC-822 (RSS), ISO-8601 (Atom / calendar) or 'YYYY-MM-DD HH:MM:SS' -> aware datetime."""
     if not s:
         return None
     s = s.strip()
@@ -189,7 +157,7 @@ def _merge_stories(per_feed: list[list[dict]]) -> list[dict]:
 
 
 def _relevant_currencies() -> set[str]:
-    """Currencies the bot reacts to (AI context + blackout). Empty set = all."""
+    """Currencies the AI context and blackout react to (empty = all)."""
     return {c.strip().upper() for c in (settings.news_currencies or "").split(",") if c.strip()}
 
 
@@ -223,11 +191,7 @@ def _tg_list() -> list[tuple[str, str]]:
 
 
 def _parse_telegram(name: str, handle: str, html: str) -> list[dict]:
-    """One t.me/s/<handle> preview page -> post dicts shaped like news stories.
-
-    Each message block is split on the wrapper div so a malformed post can only lose
-    itself, not the rest of the page.
-    """
+    """t.me/s/<handle> preview page -> story-shaped posts (split per message so one bad post can't break the page)."""
     if not html:
         return []
     posts = []
@@ -272,8 +236,7 @@ def _merge_posts(per_channel: list[list[dict]]) -> list[dict]:
 
 
 def _parse_calendar(data: list) -> list[dict]:
-    """Keep the whole week the feed publishes — the dashboard shows every currency.
-    `news_currencies` narrows only what the AI sees and what triggers a blackout."""
+    """The whole week, all currencies (news_currencies only narrows the AI and blackout)."""
     out = []
     for e in data or []:
         if not isinstance(e, dict):
@@ -288,7 +251,7 @@ def _parse_calendar(data: list) -> list[dict]:
             "impact_rank": IMPACT_RANK.get(impact.lower(), 0),
             "forecast": str(e.get("forecast") or ""),
             "previous": str(e.get("previous") or ""),
-            "actual": str(e.get("actual") or ""),  # feed usually omits; kept for forward-compat
+            "actual": str(e.get("actual") or ""),
             "date": dt.isoformat() if dt else None,
             "ts": dt.timestamp() if dt else 0.0,
         })
@@ -299,140 +262,111 @@ def _parse_calendar(data: list) -> list[dict]:
 # --------------------------------------------------------------------------- #
 #  Fetch + cache
 # --------------------------------------------------------------------------- #
-_RETRY_AFTER_FAIL = 60   # transient failure (network hiccup, empty parse)
-# The calendar host answers 429 for a sustained period once you poll it too often, so
-# retrying a minute later just renews the ban. Back off properly instead.
-_RETRY_AFTER_429 = 1800  # 30 min
+_RETRY_AFTER_FAIL = 60     # transient failure
+_RETRY_AFTER_429 = 1800    # the calendar host keeps 429-ing if retried sooner
 
 
-def _due(cache: dict, ttl: float) -> bool:
-    """Time-based (not data-based) so the failure backoff applies even on a cold start."""
-    return (time.time() - cache["ts"]) >= ttl
+async def _cached_fetch(key: str, ttl: float, fetch) -> list[dict]:
+    """TTL cache with Mongo hydration; on failure keep the last good data and back off.
 
-
-async def _hydrate(key: str) -> None:
-    """Reload a cold in-process cache from Mongo (once per process)."""
-    cache = _CACHE_KEYS[key]
-    if cache["hydrated"] or cache["data"]:
-        return
-    try:
-        doc = await db.news_cache.find_one({"_id": key})
-        cache["hydrated"] = True   # DB answered — no need to ask again this process
-        if doc and doc.get("data"):
-            cache["data"], cache["ts"] = doc["data"], float(doc.get("ts") or 0.0)
-            logger.info(f"{key} cache restored from Mongo ({len(cache['data'])} items)")
-    except Exception as e:  # noqa: BLE001 — leave `hydrated` False so a later call retries
-        logger.warning(f"{key} cache restore skipped ({type(e).__name__})")
-
-
-async def _mark_success(key: str, cache: dict, data: list) -> None:
-    cache["data"], cache["ts"] = data, time.time()
-    try:
-        await db.news_cache.update_one(
-            {"_id": key}, {"$set": {"data": data, "ts": cache["ts"]}}, upsert=True
-        )
-    except Exception as e:  # noqa: BLE001 — persistence is best-effort
-        logger.warning(f"{key} cache persist failed ({type(e).__name__})")
-
-
-def _mark_failure(cache: dict, ttl: float, retry_after: float = _RETRY_AFTER_FAIL) -> None:
-    """Keep the last good data and allow a retry in `retry_after` seconds — this is what
-    stops us from hammering a rate-limited (HTTP 429) endpoint every tick."""
-    cache["ts"] = time.time() - max(0.0, ttl - retry_after)
+    `fetch()` returns (items, retry_after_seconds_if_empty).
+    """
+    if not settings.news_enabled:
+        return []
+    cache = _caches[key]
+    if not cache["hydrated"] and not cache["data"]:
+        try:
+            doc = await db.news_cache.find_one({"_id": key})
+            cache["hydrated"] = True
+            if doc and doc.get("data"):
+                cache["data"], cache["ts"] = doc["data"], float(doc.get("ts") or 0.0)
+                logger.info(f"{key} cache restored from Mongo ({len(cache['data'])} items)")
+        except Exception as e:  # noqa: BLE001 — retried on the next call
+            logger.warning(f"{key} cache restore skipped ({type(e).__name__})")
+    if time.time() - cache["ts"] < ttl:
+        return cache["data"]
+    async with cache["lock"]:
+        if time.time() - cache["ts"] < ttl:
+            return cache["data"]
+        items, retry_after = await fetch()
+        if items:
+            cache["data"], cache["ts"] = items, time.time()
+            try:
+                await db.news_cache.update_one({"_id": key}, {"$set": {"data": items, "ts": cache["ts"]}}, upsert=True)
+            except Exception as e:  # noqa: BLE001 — persistence is best-effort
+                logger.warning(f"{key} cache persist failed ({type(e).__name__})")
+        else:  # next attempt in `retry_after` seconds
+            cache["ts"] = time.time() - max(0.0, ttl - retry_after)
+        return cache["data"]
 
 
 async def _get(client: httpx.AsyncClient, url: str) -> bytes:
+    """Body of a 200 response, or b"" (a failed source is just skipped)."""
     try:
         r = await client.get(url, headers={"User-Agent": _UA}, follow_redirects=True, timeout=15)
         if r.status_code == 200:
             return r.content
         logger.warning(f"news fetch {url}: HTTP {r.status_code}")
-    except Exception as e:  # noqa: BLE001 — any network hiccup: skip this source
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"news fetch failed {url}: {type(e).__name__}")
     return b""
 
 
-async def get_news(force: bool = False) -> list[dict]:
-    if not settings.news_enabled:
-        return []
-    ttl = settings.news_refresh_sec
-    await _hydrate("news")
-    if not force and not _due(_news_cache, ttl):
-        return _news_cache["data"]
-    async with _news_lock:
-        if not force and not _due(_news_cache, ttl):
-            return _news_cache["data"]
+async def get_news() -> list[dict]:
+    async def fetch():
         feeds = _feed_list()
         async with httpx.AsyncClient() as client:
             payloads = await asyncio.gather(*[_get(client, url) for _, url in feeds])
-        per_feed = await asyncio.to_thread(
-            lambda: [_parse_feed(name, raw) for (name, _), raw in zip(feeds, payloads)]
-        )
-        merged = _merge_stories(per_feed)
-        if merged:
-            await _mark_success("news", _news_cache, merged)
-        else:
-            _mark_failure(_news_cache, ttl)   # keep whatever we already had
-        return _news_cache["data"]
+        per_feed = await asyncio.to_thread(lambda: [_parse_feed(n, raw) for (n, _), raw in zip(feeds, payloads)])
+        return _merge_stories(per_feed), _RETRY_AFTER_FAIL
+    return await _cached_fetch("news", settings.news_refresh_sec, fetch)
 
 
-async def get_telegram(force: bool = False) -> list[dict]:
-    """Latest posts from the configured public Telegram channels (cached like the feeds)."""
-    if not settings.news_enabled:
-        return []
-    ttl = settings.news_refresh_sec
-    await _hydrate("telegram")
-    if not force and not _due(_tg_cache, ttl):
-        return _tg_cache["data"]
-    async with _tg_lock:
-        if not force and not _due(_tg_cache, ttl):
-            return _tg_cache["data"]
+async def get_telegram() -> list[dict]:
+    async def fetch():
         channels = _tg_list()
         if not channels:
-            return _tg_cache["data"]
+            return [], _RETRY_AFTER_FAIL
         async with httpx.AsyncClient() as client:
-            pages = await asyncio.gather(
-                *[_get(client, f"https://t.me/s/{h}") for _, h in channels])
+            pages = await asyncio.gather(*[_get(client, f"https://t.me/s/{h}") for _, h in channels])
         per_channel = await asyncio.to_thread(
-            lambda: [_parse_telegram(name, h, raw.decode("utf-8", "ignore"))
-                     for (name, h), raw in zip(channels, pages)])
-        merged = _merge_posts(per_channel)
-        if merged:
-            await _mark_success("telegram", _tg_cache, merged)
-        else:
-            _mark_failure(_tg_cache, ttl)   # keep the last good timeline
-        return _tg_cache["data"]
+            lambda: [_parse_telegram(n, h, raw.decode("utf-8", "ignore")) for (n, h), raw in zip(channels, pages)])
+        return _merge_posts(per_channel), _RETRY_AFTER_FAIL
+    return await _cached_fetch("telegram", settings.news_refresh_sec, fetch)
 
 
-async def get_calendar(force: bool = False) -> list[dict]:
-    if not settings.news_enabled:
-        return []
-    ttl = settings.news_calendar_refresh_sec
-    await _hydrate("calendar")
-    if not force and not _due(_cal_cache, ttl):
-        return _cal_cache["data"]
-    async with _cal_lock:
-        if not force and not _due(_cal_cache, ttl):
-            return _cal_cache["data"]
-        data, status = [], 0
-        async with httpx.AsyncClient() as client:
-            try:
+async def get_calendar() -> list[dict]:
+    async def fetch():
+        status = 0
+        try:
+            async with httpx.AsyncClient() as client:
                 r = await client.get(settings.news_calendar_url, headers={"User-Agent": _UA},
                                      follow_redirects=True, timeout=15)
-                status = r.status_code
-                if status == 200:
-                    data = r.json()
-                else:  # 429 rate-limit etc. — back off, keep last good data
-                    logger.warning(f"calendar fetch: HTTP {status}")
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"calendar fetch failed: {type(e).__name__}")
-        events = await asyncio.to_thread(_parse_calendar, data) if data else []
-        if events:
-            await _mark_success("calendar", _cal_cache, events)
-        else:  # keep the last good week; wait out a rate-limit rather than renewing it
-            _mark_failure(_cal_cache, ttl,
-                          _RETRY_AFTER_429 if status == 429 else _RETRY_AFTER_FAIL)
-        return _cal_cache["data"]
+            status = r.status_code
+            if status == 200:
+                return await asyncio.to_thread(_parse_calendar, r.json()), _RETRY_AFTER_FAIL
+            logger.warning(f"calendar fetch: HTTP {status}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"calendar fetch failed: {type(e).__name__}")
+        return [], _RETRY_AFTER_429 if status == 429 else _RETRY_AFTER_FAIL
+    return await _cached_fetch("calendar", settings.news_calendar_refresh_sec, fetch)
+
+
+def _updated_at(key: str) -> Optional[str]:
+    ts = _caches[key]["ts"]
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat() if ts else None
+
+
+def news_updated_at() -> Optional[str]:
+    return _updated_at("news")
+
+
+def telegram_updated_at() -> Optional[str]:
+    return _updated_at("telegram")
+
+
+def calendar_updated_at() -> Optional[str]:
+    return _updated_at("calendar")
 
 
 # --------------------------------------------------------------------------- #
@@ -441,15 +375,12 @@ async def get_calendar(force: bool = False) -> list[dict]:
 _brief_cache: dict = {"data": None, "ts": 0.0}
 _brief_lock = asyncio.Lock()
 
-async def _market_snapshot(symbols=("BTCUSD", "ETHUSD")) -> list[dict]:
-    """Factual overnight numbers, computed in code — never asked of the model.
 
-    The AI writes prose only; every figure a trader might act on comes from the
-    exchange, so the brief cannot invent a price, a move, or a funding rate.
-    """
+async def _market_snapshot(symbols=("BTCUSD", "ETHUSD")) -> list[dict]:
+    """Exchange facts for the brief — computed in code so the model can't invent a number."""
+    import pandas as pd
     from bot.delta_client import DeltaClient
     from bot.indicators import calc_rsi, calc_ema
-    import pandas as pd
 
     d = DeltaClient()
     out = []
@@ -475,8 +406,6 @@ async def _market_snapshot(symbols=("BTCUSD", "ETHUSD")) -> list[dict]:
                 rsi = calc_rsi(closes, settings.rsi_period)
                 val = rsi.iloc[-1]
                 row["rsi_1h"] = round(float(val), 1) if val == val else None
-                # A factual technical read to sit alongside the news, so the day bias
-                # isn't formed from headlines alone.
                 ef = calc_ema(closes, settings.ema_fast).iloc[-1]
                 es = calc_ema(closes, settings.ema_slow).iloc[-1]
                 if ef == ef and es == es:
@@ -538,12 +467,8 @@ inputs. Never write a bare "BTC price" or "watch the market"."""
 
 
 async def get_brief(force: bool = False) -> Optional[dict]:
-    """AI summary of the day's news so far (cached; `force` regenerates).
-
-    Deliberately manual/cached rather than per-page-load: each generation costs
-    provider tokens, and the underlying headlines only move every few minutes.
-    """
-    from bot import ai_brain  # local import: avoids a cycle at module load
+    """AI day brief from headlines + Telegram + market facts (cached; `force` regenerates and spends tokens)."""
+    from bot import ai_brain  # local import avoids a cycle
 
     if not settings.news_enabled:
         return None
@@ -554,15 +479,12 @@ async def get_brief(force: bool = False) -> Optional[dict]:
     async with _brief_lock:
         if not force and _brief_cache["data"] and (time.time() - _brief_cache["ts"]) < ttl:
             return _brief_cache["data"]
-        # Both streams feed the brief, kept LABELLED so the model can weigh a fast
-        # unconfirmed channel post differently from a published outlet story.
+        # Streams stay labelled so the model can weigh an unconfirmed post below an outlet story.
         stories, tg = await asyncio.gather(get_news(), get_telegram())
         if not stories and not tg:
             return _brief_cache["data"]
 
-        # Rolling 24h rather than the UTC calendar day: at 06:00 UTC a calendar-day
-        # filter throws away most of the overnight session, which is exactly the news
-        # a pre-market brief is about.
+        # Rolling 24h (not the UTC day) so the overnight session is kept.
         cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
 
         def _recent(items, cap):
@@ -580,9 +502,7 @@ async def get_brief(force: bool = False) -> Optional[dict]:
             "telegram_posts": [{"source": p["source"], "title": p["title"],
                                 "sentiment": p["sentiment"]} for p in use_tg],
         }
-        use = [*use_rss, *use_tg]
-        # Gemini writes the brief; Claude (API, then local CLI) catches failures.
-        if not ai_brain.available():
+        if not ai_brain.available(ai_brain.BRIEF_PROVIDERS):
             logger.warning("brief skipped — no AI provider configured")
             return _brief_cache["data"]
 
@@ -594,7 +514,7 @@ async def get_brief(force: bool = False) -> Optional[dict]:
             return _brief_cache["data"]
 
         def _lvl(v):
-            """Accept a level only if it's a plausible number (model may send null/text)."""
+            """Positive number or None (the model may send null/text)."""
             try:
                 f = float(v)
                 return round(f, 2) if f > 0 else None
@@ -631,7 +551,7 @@ async def get_brief(force: bool = False) -> Optional[dict]:
             "risk": str(out.get("risk") or "")[:220],
             "market": market,          # code-computed, not model output
             "via": out.get("_via"),
-            "articles_used": len(use),
+            "articles_used": len(use_rss) + len(use_tg),
             "rss_used": len(use_rss),
             "telegram_used": len(use_tg),
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -646,7 +566,7 @@ async def get_brief(force: bool = False) -> Optional[dict]:
 
 
 async def brief_from_cache() -> Optional[dict]:
-    """Last generated brief (in-process, else the persisted copy). Never calls the AI."""
+    """Last brief (memory, else Mongo). Never calls the AI."""
     if _brief_cache["data"]:
         return _brief_cache["data"]
     try:
@@ -659,31 +579,19 @@ async def brief_from_cache() -> Optional[dict]:
     return None
 
 
-def news_updated_at() -> Optional[str]:
-    return datetime.fromtimestamp(_news_cache["ts"], timezone.utc).isoformat() if _news_cache["ts"] else None
-
-
-def telegram_updated_at() -> Optional[str]:
-    return datetime.fromtimestamp(_tg_cache["ts"], timezone.utc).isoformat() if _tg_cache["ts"] else None
-
-
-def calendar_updated_at() -> Optional[str]:
-    return datetime.fromtimestamp(_cal_cache["ts"], timezone.utc).isoformat() if _cal_cache["ts"] else None
-
-
 # --------------------------------------------------------------------------- #
 #  AI context + trading blackout
 # --------------------------------------------------------------------------- #
 def _upcoming_high_impact(events: list[dict], within_hours: float) -> list[dict]:
     now = datetime.now(timezone.utc).timestamp()
     horizon = now + within_hours * 3600
-    # from ~5 min ago (just-released, still moving) out to the horizon
+    # From ~5 min ago (just released, still moving) out to the horizon.
     return [e for e in events
             if e["impact_rank"] >= 3 and _is_relevant(e) and (now - 300) <= e["ts"] <= horizon]
 
 
 async def ai_context(symbol: str = "") -> Optional[dict]:
-    """Compact news+events block for the AI snapshot, or None if disabled/empty."""
+    """News + upcoming events + day bias for the AI snapshot, or None if disabled/empty."""
     if not (settings.news_enabled and settings.news_ai_context):
         return None
     news, cal = await asyncio.gather(get_news(), get_calendar())
@@ -695,9 +603,7 @@ async def ai_context(symbol: str = "") -> Optional[dict]:
         "forecast": e["forecast"], "previous": e["previous"],
     } for e in up[:6]]
     heads = [{"source": s["source"], "title": s["title"], "sentiment": s["sentiment"]} for s in news[:8]]
-    # The day brief already synthesises RSS + Telegram + technicals into one directional
-    # read. Passing it through means the trading model sees that conclusion instead of
-    # re-deriving it from raw headlines every tick. Stale briefs are dropped.
+    # Pass the day brief's bias through (if < 12h old) instead of re-deriving it every tick.
     day_bias = None
     try:
         b = await brief_from_cache()
@@ -729,9 +635,7 @@ async def ai_context(symbol: str = "") -> Optional[dict]:
 
 
 async def in_blackout() -> tuple[bool, Optional[dict]]:
-    """True if a High-impact (relevant-currency) event is within news_blackout_min minutes
-    (before OR after) of now — the scheduler uses this to skip opening NEW entries.
-    Existing positions are untouched (they keep their exchange SL/TP)."""
+    """(True, event) if a relevant high-impact event is within ±news_blackout_min of now (blocks new entries only)."""
     if not settings.news_enabled or settings.news_blackout_min <= 0:
         return False, None
     cal = await get_calendar()

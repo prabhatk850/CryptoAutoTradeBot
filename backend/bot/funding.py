@@ -1,12 +1,4 @@
-"""
-Perpetual funding-rate + open-interest tracking.
-
-"Extreme" funding is symbol-relative (BTC and ETH run different typical funding
-ranges), so this keeps a rolling history in Mongo (db.funding_history — the same
-durability pattern bot_state/trade_outcomes already use) and classifies the CURRENT
-reading against its own percentile rank rather than a fixed absolute threshold.
-Needs a minimum sample count before calling anything "extreme".
-"""
+"""Funding-rate tracking: "extreme" is judged by percentile against the symbol's own Mongo history."""
 from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -17,9 +9,7 @@ from db import db
 
 
 async def record_and_bias(symbol: str, delta: DeltaClient) -> Optional[dict]:
-    """Fetch current funding/OI, persist a history point, and return the
-    symbol-relative bias read: {funding_rate, oi, oi_change_6h, percentile, extreme}.
-    `extreme` is "high"/"low"/None; None until enough history has accumulated."""
+    """Record the current funding/OI and classify it; `extreme` stays None until enough history exists."""
     try:
         cur = await delta.get_funding_and_oi(symbol)
     except Exception:
@@ -34,7 +24,7 @@ async def record_and_bias(symbol: str, delta: DeltaClient) -> Optional[dict]:
             "funding_rate": cur["funding_rate"], "oi": cur.get("oi"),
         })
     except Exception:
-        pass  # a missed history point degrades the percentile, not correctness
+        pass  # a missed point only weakens the percentile
 
     since = now - timedelta(days=settings.funding_history_window_days)
     try:

@@ -1,25 +1,27 @@
+"""Market data, chart overlays, and a read-only AI analysis (never places orders)."""
 import asyncio
 import logging
 import math
-import time as _time
+import time
+
 import httpx
+import pandas as pd
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
+
+from bot import ai_brain, edge, smc
 from bot.delta_client import DeltaClient
+from bot.indicators import calc_ema, calc_macd, candles_to_df
 from bot.lux_indicators import supertrend_ai, trendline_breakout_navigator, fair_value_gaps, inverse_fvg
-from bot.indicators import compute_indicators, calc_macd, candles_to_df, calc_ema
-from bot import ai_brain
-from bot import smc as _smc
+from bot.scheduler import BIAS_TXT, analyze_timeframe, trend_bias
 from config import settings
-import pandas as _pd
 
 router = APIRouter(prefix="/market", tags=["market"])
 logger = logging.getLogger("bot.market")
 _delta = DeltaClient()
 
-# Cache for the heavy indicators endpoint (per symbol+resolution+limit).
-_IND_CACHE: dict[str, tuple[float, dict]] = {}
 _IND_TTL = 12.0
+_IND_CACHE: dict[str, tuple[float, dict]] = {}   # "sym:res:limit" -> (ts, payload)
 
 
 def _finite(v):
@@ -27,9 +29,8 @@ def _finite(v):
 
 
 def _error(e: Exception, what: str):
-    """Return a clean JSON error instead of a 500 stack trace."""
-    status = 502
-    detail = str(e)
+    """Clean JSON error (upstream status when known) instead of a 500 trace."""
+    status, detail = 502, str(e)
     if isinstance(e, httpx.HTTPStatusError):
         status = e.response.status_code
         try:
@@ -42,199 +43,138 @@ def _error(e: Exception, what: str):
 
 @router.get("/ticker")
 async def ticker(symbol: str = None):
-    sym = symbol or settings.trading_symbol
     try:
-        return await _delta.get_ticker(sym)
+        return await _delta.get_ticker(symbol or settings.trading_symbol)
     except Exception as e:
         return _error(e, "get_ticker")
 
 
 @router.get("/candles")
 async def candles(symbol: str = None, resolution: int = 5, limit: int = 100):
-    sym = symbol or settings.trading_symbol
     try:
-        return await _delta.get_candles(sym, resolution, limit)
+        return await _delta.get_candles(symbol or settings.trading_symbol, resolution, limit)
     except Exception as e:
         return _error(e, "get_candles")
 
 
 @router.get("/indicators")
 async def indicators(symbol: str = None, resolution: int = 5, limit: int = 300):
-    """SuperTrend AI + Trendline Navigator series aligned to candle times, for chart overlay."""
+    """Chart overlays (SuperTrend, trendlines, FVG/IFVG, SMC, MACD, volume, EMA200) for the last `limit` bars."""
     sym = symbol or settings.trading_symbol
     key = f"{sym}:{resolution}:{limit}"
-    now = _time.time()
+    now = time.time()
     cached = _IND_CACHE.get(key)
     if cached and now - cached[0] < _IND_TTL:
         return cached[1]
     try:
-        # fetch enough history for long-swing indicators, then expose the last `limit`
-        fetch = max(limit, settings.candle_limit)
-        candles = await _delta.get_candles(sym, resolution, fetch)
-        keep = {int(c["time"]) for c in candles[-limit:]}
+        fetch = max(limit, settings.candle_limit)  # extra history warms up long indicators
+        bars = await _delta.get_candles(sym, resolution, fetch)
+        keep = {int(c["time"]) for c in bars[-limit:]}
 
-        async def _safe_traded():
-            # volume lives on the traded feed (mark candles have none)
+        async def _traded():  # volume only exists on the traded feed
             try:
                 return await _delta.get_candles(sym, resolution, fetch, mark=False)
             except Exception:
                 return []
 
-        # Run the CPU-heavy indicators OFF the event loop so other requests aren't blocked.
         st, tn, fvg, ifvg, smc_r, macd_r, traded = await asyncio.gather(
-            asyncio.to_thread(supertrend_ai, candles),
-            asyncio.to_thread(trendline_breakout_navigator, candles),
-            asyncio.to_thread(fair_value_gaps, candles),
-            asyncio.to_thread(inverse_fvg, candles),
-            asyncio.to_thread(_smc.analyze, candles),
-            asyncio.to_thread(_macd_series, candles, keep),
-            _safe_traded(),
+            asyncio.to_thread(supertrend_ai, bars),
+            asyncio.to_thread(trendline_breakout_navigator, bars),
+            asyncio.to_thread(fair_value_gaps, bars),
+            asyncio.to_thread(inverse_fvg, bars),
+            asyncio.to_thread(smc.analyze, bars),
+            asyncio.to_thread(_macd_series, bars, keep),
+            _traded(),
         )
-
-        out: dict = {"symbol": sym, "supertrend": None, "trendline": None, "fvg": None,
-                     "ifvg": None, "smc": smc_r, "macd": macd_r,
-                     "volume": _volume_series(candles, traded, keep),
-                     "ema200": _ema_series(candles, 200, keep)}
+        out: dict = {"symbol": sym, "supertrend": None, "trendline": None, "fvg": None, "ifvg": None,
+                     "smc": smc_r, "macd": macd_r, "volume": _volume_series(bars, traded, keep),
+                     "ema200": _ema_series(bars, 200, keep)}
         if st:
-            pts = [
-                {"time": int(t), "ts": _finite(ts), "os": o, "ama": _finite(ama)}
-                for t, ts, o, ama in zip(st["time"], st["ts"], st["os"], st["ama"])
-                if int(t) in keep
-            ]
+            pts = [{"time": int(t), "ts": _finite(ts), "os": o, "ama": _finite(ama)}
+                   for t, ts, o, ama in zip(st["time"], st["ts"], st["os"], st["ama"]) if int(t) in keep]
             out["supertrend"] = {"points": pts, "signals": st["signals"], "latest": st["latest"]}
         if tn:
             out["trendline"] = {"points": [p for p in tn["points"] if p["time"] in keep],
                                 "active": [p for p in tn["active"] if p["time"] in keep],
                                 "signals": tn["signals"], "latest": tn["latest"]}
-        min_h = settings.fvg_min_pct / 100  # only show zones whose height >= this % of price
 
-        def _big_enough(top, bottom, mid):
-            base = mid or ((top + bottom) / 2)
-            return base > 0 and abs(top - bottom) / base >= min_h
+        min_h = settings.fvg_min_pct / 100
+
+        def _big_enough(top, bottom):
+            mid = (top + bottom) / 2
+            return mid > 0 and abs(top - bottom) / mid >= min_h
 
         if fvg:
-            zones = []
-            for z in fvg["unmitigated"]:
-                mid = round((z["top"] + z["bottom"]) / 2, 2)
-                if _big_enough(z["top"], z["bottom"], mid):
-                    zones.append({**z, "mid": mid})
+            zones = [{**z, "mid": round((z["top"] + z["bottom"]) / 2, 2)}
+                     for z in fvg["unmitigated"] if _big_enough(z["top"], z["bottom"])]
             out["fvg"] = {"zones": zones[-20:], "end": fvg["end"], "latest": fvg["latest"]}
         if ifvg:
-            zones = [z for z in ifvg["zones"] if _big_enough(z["top"], z["bottom"], z.get("mid"))]
-            out["ifvg"] = {"zones": zones, "end": int(candles[-1]["time"]), "latest": ifvg["latest"]}
-
+            out["ifvg"] = {"zones": [z for z in ifvg["zones"] if _big_enough(z["top"], z["bottom"])],
+                           "end": int(bars[-1]["time"]), "latest": ifvg["latest"]}
         _IND_CACHE[key] = (now, out)
         return out
     except Exception as e:
         return _error(e, "indicators")
 
 
-def _macd_series(candles, keep):
-    """Per-bar MACD (12/26/9) for the chart sub-pane, filtered to the visible window."""
-    df = candles_to_df(candles)
+def _macd_series(bars, keep):
+    """Per-bar MACD for the visible window."""
+    df = candles_to_df(bars)
     if df.empty or "close" not in df:
         return None
     line, sig, hist = calc_macd(df["close"])
-    pts = []
-    for t, m, s, h in zip(df["timestamp"], line, sig, hist):
-        if _pd.isna(m) or _pd.isna(s):
-            continue
-        ti = int(t)
-        if ti not in keep:
-            continue
-        pts.append({"time": ti, "macd": round(float(m), 4),
-                    "signal": round(float(s), 4), "hist": round(float(h), 4)})
+    pts = [{"time": int(t), "macd": round(float(m), 4), "signal": round(float(s), 4), "hist": round(float(h), 4)}
+           for t, m, s, h in zip(df["timestamp"], line, sig, hist)
+           if not (pd.isna(m) or pd.isna(s)) and int(t) in keep]
     if not pts:
         return None
     last = pts[-1]
-    state = ("BULLISH" if last["hist"] > 0 else "BEARISH" if last["hist"] < 0 else "NEUTRAL")
+    state = "BULLISH" if last["hist"] > 0 else "BEARISH" if last["hist"] < 0 else "NEUTRAL"
     return {"points": pts, "latest": {**last, "state": state}}
 
 
-def _ema_series(candles, period, keep):
-    """EMA over the full fetched history (so long MAs like 200 are warmed up),
-    returned only for the visible window."""
-    df = candles_to_df(candles)
+def _ema_series(bars, period, keep):
+    """EMA over full history (warmed up), returned for the visible window."""
+    df = candles_to_df(bars)
     if df.empty or "close" not in df:
         return None
-    e = calc_ema(df["close"], period)
     pts = [{"time": int(t), "value": round(float(v), 2)}
-           for t, v in zip(df["timestamp"], e)
-           if int(t) in keep and _pd.notna(v)]
+           for t, v in zip(df["timestamp"], calc_ema(df["close"], period)) if int(t) in keep and pd.notna(v)]
     return {"points": pts} if pts else None
 
 
-def _volume_series(mark_candles, traded, keep):
-    """Volume bars for the chart sub-pane: magnitude from the traded feed, colored by
-    the (mark) candle direction, plus a 20-period volume moving average."""
-    volmap = {int(c["time"]): float(c.get("volume") or 0) for c in (traded or [])}
-    pts = []
-    for c in mark_candles:
-        t = int(c["time"])
-        if t not in keep:
-            continue
-        pts.append({"time": t, "value": round(volmap.get(t, 0.0), 2), "up": c["close"] >= c["open"]})
+def _volume_series(mark_bars, traded, keep, win: int = 20):
+    """Traded volume coloured by mark-candle direction, plus a 20-bar average."""
+    volmap = {int(c["time"]): float(c.get("volume") or 0) for c in traded or []}
+    pts = [{"time": int(c["time"]), "value": round(volmap.get(int(c["time"]), 0.0), 2), "up": c["close"] >= c["open"]}
+           for c in mark_bars if int(c["time"]) in keep]
     if not pts:
         return None
     vals = [p["value"] for p in pts]
-    win = 20
-    ma = [{"time": pts[i]["time"],
-           "value": round(sum(vals[max(0, i - win + 1):i + 1]) / len(vals[max(0, i - win + 1):i + 1]), 2)}
-          for i in range(len(pts))]
+    ma = [{"time": p["time"], "value": round(sum(vals[max(0, i - win + 1):i + 1]) / len(vals[max(0, i - win + 1):i + 1]), 2)}
+          for i, p in enumerate(pts)]
     avg20 = round(sum(vals[-win:]) / min(len(vals), win), 2)
-    latest = vals[-1]
     return {"points": pts, "ma": ma,
-            "latest": {"volume": latest, "avg20": avg20,
-                       "rel": round(latest / avg20, 2) if avg20 else None}}
-
-
-def _analyze_tf(candles):
-    ind = compute_indicators(
-        candles, ema_fast=settings.ema_fast, ema_slow=settings.ema_slow,
-        rsi_period=settings.rsi_period, rsi_oversold=settings.rsi_oversold,
-        rsi_overbought=settings.rsi_overbought,
-    )
-    return (ind, supertrend_ai(candles), trendline_breakout_navigator(candles),
-            fair_value_gaps(candles), inverse_fvg(candles))
+            "latest": {"volume": vals[-1], "avg20": avg20, "rel": round(vals[-1] / avg20, 2) if avg20 else None}}
 
 
 @router.get("/analyze")
 async def analyze(symbol: str = None):
-    """Read-only AI analysis of the current chart: builds the same multi-timeframe
-    snapshot the live bot uses, asks Claude for a plan (direction / structure SL /
-    TP1-3 / confidence / reasoning), and returns both. Places NO order."""
+    """The live bot's multi-timeframe snapshot plus an AI plan. Advisory only — places no order."""
     sym = symbol or settings.trading_symbol
     try:
         c_entry = await _delta.get_candles(sym, settings.entry_timeframe, settings.candle_limit)
         c_trend = await _delta.get_candles(sym, settings.trend_timeframe, settings.candle_limit)
         c_ltf = await _delta.get_candles(sym, settings.ltf_timeframe, settings.candle_limit)
-        (ind, st, tn, fvg, ifvg), (ind_t, st_t, tn_t, _, _), (ind_l, st_l, tn_l, _, _) = await asyncio.gather(
-            asyncio.to_thread(_analyze_tf, c_entry),
-            asyncio.to_thread(_analyze_tf, c_trend),
-            asyncio.to_thread(_analyze_tf, c_ltf),
-        )
-        from bot.scheduler import _trend_bias
-        from bot import smc
-        bias = _trend_bias(ind_t, st_t, tn_t)
-        bias_txt = {1: "bullish", -1: "bearish", 0: "neutral"}[bias]
-        smc_e, smc_t, smc_l = await asyncio.gather(
-            asyncio.to_thread(smc.analyze, c_entry),
-            asyncio.to_thread(smc.analyze, c_trend),
-            asyncio.to_thread(smc.analyze, c_ltf),
-        )
-        from bot import edge as edge_mod
-        hist_edge = await edge_mod.get_edge(sym)
-        snapshot = ai_brain.build_snapshot(sym, ind["close"], c_entry, c_trend, ind, st, tn,
-                                           fvg, ifvg, ind_t, st_t, tn_t, bias_txt, {}, {}, {},
-                                           smc_entry=smc_e, smc_trend=smc_t,
-                                           c_ltf=c_ltf, ind_l=ind_l, st_l=st_l, tn_l=tn_l, smc_ltf=smc_l,
-                                           historical_edge=hist_edge)
+        entry, trend, timing = await asyncio.gather(*(asyncio.to_thread(analyze_timeframe, c)
+                                                      for c in (c_entry, c_trend, c_ltf)))
+        snapshot = ai_brain.build_snapshot(sym, entry, trend, timing, BIAS_TXT[trend_bias(trend)], {}, {},
+                                           historical_edge=await edge.get_edge(sym))
         if not ai_brain.available():
             return {"symbol": sym, "snapshot": snapshot, "ai_plan": None,
-                    "note": "AI brain unavailable (Claude CLI not found or AI_ENABLED=false)."}
+                    "note": "AI brain unavailable (no configured provider or AI_ENABLED=false)."}
         plan = await asyncio.to_thread(ai_brain.analyze, snapshot)
-        return {"symbol": sym, "snapshot": snapshot, "ai_plan": plan,
-                "note": "Advisory only — no order placed."}
+        return {"symbol": sym, "snapshot": snapshot, "ai_plan": plan, "note": "Advisory only — no order placed."}
     except Exception as e:
         return _error(e, "analyze")
 

@@ -1,11 +1,4 @@
-"""
-Shared fractal swing-high/low detection.
-
-Extracted from smc.py (the richest of several near-duplicate swing finders that had
-grown independently in smc.py, scheduler.py and ai_brain.py) so new code — like
-divergence detection — has one canonical implementation to build on instead of a
-fourth reimplementation. Behavior is unchanged from the original smc._swings.
-"""
+"""The single fractal swing-high/low finder shared by SMC, divergence, targets and the AI snapshot."""
 from __future__ import annotations
 
 

@@ -24,8 +24,7 @@ const when = (iso: string) =>
 
 const PAGE = 8;      // rows appended each time the list is scrolled to the bottom
 const PREVIEW = 3;   // rows shown while collapsed
-// Past this, "no recent trades" stops being a plausible quiet market and starts
-// looking like the outcome recorder has stopped writing.
+// Older than this, "no recent trades" likely means the outcome recorder stopped.
 const STALE_AFTER_DAYS = 3;
 
 export default function TrainingMonitor() {

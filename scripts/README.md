@@ -28,9 +28,8 @@ Unregister-ScheduledTask -TaskName "ForexBotBackend" -Confirm:$false
 ```
 
 ## Option C — True 24/7 (runs even when your PC is off)
-Your PC must be on for Options A/B. For real always-on, deploy the backend to a
-cheap cloud host (Railway, Render, or a $5 VPS). MongoDB (Atlas) and Delta are
-already cloud, so only the backend needs to move. Ask and I'll prepare the deploy.
+Your PC must be on for Options A/B. For always-on, run the Docker images on a small VPS —
+see "Server deploy" in the root README.md.
 
 ## Notes
 - **PC sleep stops it.** Set Windows power plan to "never sleep" if you want it

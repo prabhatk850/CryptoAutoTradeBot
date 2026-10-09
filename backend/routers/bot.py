@@ -1,10 +1,11 @@
+"""Bot control, backtest, strategy performance and the training monitor."""
 import asyncio
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
-from bot.scheduler import start_bot, stop_bot, bot_status, set_symbol
-from bot.delta_client import DeltaClient, minutes_to_resolution
+from bot.scheduler import start_bot, stop_bot, bot_status
+from bot.delta_client import DeltaClient
 from bot.backtest import run_backtest
 from bot import strategies, autotune
 from config import settings
@@ -31,12 +32,7 @@ async def status():
 
 @router.get("/backtest")
 async def backtest(symbol: str = None, bars: int = 1500, adx_gate_min: float = None):
-    """Backtest every strategy + the combined engine on recent history.
-
-    Pass `adx_gate_min` (e.g. settings.adx_min_trend = 20) to also get a
-    COMBINED_ADX_GATED row for a direct before/after comparison — the evidence
-    used to decide config.adx_gate_enabled's default.
-    """
+    """Backtest every strategy + COMBINED; `adx_gate_min` adds a COMBINED_ADX_GATED comparison row."""
     sym = symbol or settings.trading_symbol
     try:
         c_entry = await _delta.get_candles(sym, settings.entry_timeframe, bars)
@@ -58,15 +54,12 @@ async def performance():
 
 @router.get("/performance/shadow")
 async def performance_shadow():
-    """Performance of shadow-only strategies (config.shadow_strategies) — crypto-
-    native signals like funding-rate bias and order-book imbalance that can't be
-    backtested (no stored history) so they build a live track record on a side
-    ledger before ever being promoted into the real, voting `strategies` CSV."""
+    """Live track record of shadow-only strategies (no history to backtest them on)."""
     return await autotune.shadow_status()
 
 
 def _skip_bucket(status: str) -> str:
-    """Group a skip reason into a human category for the training view."""
+    """Human category for a skip reason."""
     s = (status or "").lower()
     if any(k in s for k in ("spread", "illiquid", "unexitable", "thin", "order book")):
         return "Illiquid market"
@@ -87,27 +80,15 @@ def _skip_bucket(status: str) -> str:
 
 @router.get("/training")
 async def training(days: int = 30, limit: int = 60):
-    """Everything needed to judge whether the bot is LEARNING correctly.
+    """Is the bot learning? Strategy (mark) vs execution (fills) P/L, skip reasons, liquidity-gate stats.
 
-    Separates the two things that used to be conflated:
-      • strategy P/L — mark→mark, the quality of the DECISION (this trains the tuner)
-      • execution P/L — real fills, the quality of the VENUE (never trains anything)
-    Plus why entries were skipped, so the guard rails are visible rather than silent.
-
-    Two different scopes on purpose:
-      • recent_trades / summary — the last `limit` verified outcomes, whenever they
-        happened. A recency list, NOT windowed, so the panel still says something
-        useful during a quiet stretch.
-      • skipped — strictly the last `days` days, because a guard-rail count is only
-        meaningful against a period.
-    `latest_closed_at` / `stale_days` exist so the first scope cannot silently go
-    stale: writer outages show up as an age, instead of month-old numbers that look live.
+    recent_trades/summary = last `limit` verified outcomes (not windowed; `stale_days` shows their age);
+    skipped = last `days` days only.
     """
     since = datetime.now(timezone.utc) - timedelta(days=days)
 
     async def _outcomes():
-        # Only trades whose fills we actually matched. Unverified rows can't be scored
-        # (a stuck position once produced 129 phantom "wins" that made this panel lie).
+        # Verified only — unverified rows once produced 129 phantom "wins".
         try:
             return [d async for d in db.trade_outcomes.find(
                 {"verified": True}, {"votes": 0}).sort("closed_at", -1).limit(limit)]
@@ -121,8 +102,7 @@ async def training(days: int = 30, limit: int = 60):
             return 0
 
     async def _liquidity_shadow():
-        """How often the (currently shadow-mode) liquidity gate WOULD have blocked
-        a trade, so enforcing it can be a data-driven decision rather than a guess."""
+        """How often the shadow liquidity gate would have blocked a trade."""
         try:
             total = await db.trade_logs.count_documents(
                 {"timestamp": {"$gte": since}, "liquidity.mode": "shadow"})
@@ -173,7 +153,7 @@ async def training(days: int = 30, limit: int = 60):
     return {
         "config": {
             "trains_on": "mark" if settings.autotune_use_mark_pnl else "fills",
-            "symbols": [s.strip().upper() for s in settings.trade_symbols.split(",") if s.strip()],
+            "symbols": settings.symbols(),
             "max_entry_spread_pct": settings.max_entry_spread_pct,
             "max_exit_slippage_pct": settings.max_exit_slippage_pct,
             "autotune_enabled": settings.autotune_enabled,
@@ -181,8 +161,8 @@ async def training(days: int = 30, limit: int = 60):
         },
         "summary": {
             "trades": n,
-            "strategy_pnl": strat_total,      # what the decisions were worth
-            "execution_pnl": exec_total,      # what the venue actually paid
+            "strategy_pnl": strat_total,
+            "execution_pnl": exec_total,
             "slippage_cost": round(exec_total - strat_total, 2),
             "strategy_win_rate": round(strat_wins / n * 100, 1) if n else 0,
             "unverified_excluded": unverified,
@@ -215,16 +195,3 @@ async def set_strategies(ids: str):
     enabled = strategies.parse_enabled(ids)
     settings.strategies = ",".join(s.value for s in enabled)
     return {"enabled": [s.value for s in enabled]}
-
-
-@router.post("/symbol")
-async def change_symbol(symbol: str):
-    """Switch the symbol the bot trades (e.g. BTCUSD / ETHUSD)."""
-    symbol = symbol.upper().strip()
-    try:
-        pid = await _delta.get_product_id(symbol)
-    except Exception:
-        pid = None
-    if not pid:
-        return JSONResponse(status_code=400, content={"error": f"Unknown symbol '{symbol}'"})
-    return set_symbol(symbol)

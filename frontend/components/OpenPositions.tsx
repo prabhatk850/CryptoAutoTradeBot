@@ -9,13 +9,15 @@ interface Pos {
   side: "LONG" | "SHORT";
   size: number;
   entry: number;
-  mark: number;
-  unrealized: number;
-  pnl_pct: number;
+  // null = no live or fresh price; render "—", never a guessed number.
+  mark: number | null;
+  unrealized: number | null;
+  pnl_pct: number | null;
+  mark_stale?: boolean;
+  mark_source?: string;
   sl: number | null;
   tps: number[];
-  // What closing right now would really fill at (walks the live book). Mark price is
-  // not tradeable, so this can differ sharply from `unrealized`.
+  // Executable close price from the live book (can differ sharply from mark-based `unrealized`).
   exit_price: number | null;
   exit_unrealized: number | null;
   slippage_pct: number | null;
@@ -29,8 +31,7 @@ export default function OpenPositions({ activeSymbol }: { activeSymbol?: string 
   const [busy, setBusy] = useState<string | null>(null);      // symbol currently acting on
   const [editSl, setEditSl] = useState<string | null>(null);  // symbol whose SL is being edited
   const [slInput, setSlInput] = useState("");
-  // Tied to a symbol so a failed close surfaces on its own card — a bare string was
-  // only ever rendered inside the SL editor, which silently swallowed close errors.
+  // Keyed by symbol so each card shows its own close/SL error.
   const [err, setErr] = useState<{ symbol: string; msg: string } | null>(null);
 
   const fetchData = async () => {
@@ -51,10 +52,10 @@ export default function OpenPositions({ activeSymbol }: { activeSymbol?: string 
   const doClose = async (p: Pos) => {
     // Quote the real fill up front — mark-based P/L is not what a market close realises.
     const est = p.exit_price != null
-      ? `\n\nFills near $${p.exit_price.toLocaleString()} (mark $${p.mark.toLocaleString()})` +
+      ? `\n\nFills near $${p.exit_price.toLocaleString()} (mark $${p.mark?.toLocaleString() ?? "—"})` +
         `\nReal P/L at that price: ${money(p.exit_unrealized ?? 0)}` +
-        (p.exit_unrealized != null && p.unrealized > 0 && p.exit_unrealized < 0
-          ? `\n\nWARNING: this position shows ${money(p.unrealized)} on mark but closing now LOSES money.`
+        (p.exit_unrealized != null && (p.unrealized ?? 0) > 0 && p.exit_unrealized < 0
+          ? `\n\nWARNING: this position shows ${money(p.unrealized ?? 0)} on mark but closing now LOSES money.`
           : "")
       : "";
     if (!window.confirm(`Close your ${p.symbol} position at market now?${est}`)) return;
@@ -125,14 +126,22 @@ export default function OpenPositions({ activeSymbol }: { activeSymbol?: string 
                   {p.side === "LONG" ? <ArrowUpRight size={11} /> : <ArrowDownRight size={11} />}{p.side} {p.size}
                 </span>
               </div>
-              <span className={clsx("text-sm font-bold tabular-nums", p.unrealized >= 0 ? "text-green-400" : "text-red-400")}>
-                {money(p.unrealized)}
-                <span className="text-[11px] text-gray-500 ml-1">({p.pnl_pct > 0 ? "+" : ""}{p.pnl_pct}%)</span>
-              </span>
+              {p.unrealized == null ? (
+                <span className="text-sm font-bold tabular-nums text-gray-500" title="No live price available — P/L unknown">
+                  —<span className="text-[11px] ml-1">price unavailable</span>
+                </span>
+              ) : (
+                <span className={clsx("text-sm font-bold tabular-nums", p.unrealized >= 0 ? "text-green-400" : "text-red-400")}>
+                  {money(p.unrealized)}
+                  <span className="text-[11px] text-gray-500 ml-1">({(p.pnl_pct ?? 0) > 0 ? "+" : ""}{p.pnl_pct}%)</span>
+                </span>
+              )}
             </div>
             <div className="mt-2 grid grid-cols-3 gap-2 text-[11px]">
               <div><div className="text-gray-500">Entry</div><div className="text-gray-300 font-mono">${p.entry.toLocaleString()}</div></div>
-              <div><div className="text-gray-500">Mark</div><div className="text-gray-300 font-mono">${p.mark.toLocaleString()}</div></div>
+              <div><div className="text-gray-500">Mark</div><div className={clsx("font-mono", p.mark == null ? "text-gray-500" : "text-gray-300")}>
+                {p.mark == null ? "—" : `$${p.mark.toLocaleString()}`}
+              </div></div>
               <div>
                 <div className="text-gray-500 flex items-center gap-1">
                   SL
@@ -172,7 +181,7 @@ export default function OpenPositions({ activeSymbol }: { activeSymbol?: string 
               <div
                 className={clsx(
                   "mt-2 rounded px-2 py-1.5 text-[11px] border",
-                  p.unrealized > 0 && p.exit_unrealized < 0
+                  (p.unrealized ?? 0) > 0 && p.exit_unrealized < 0
                     ? "bg-amber-500/10 border-amber-500/40"
                     : "bg-[#161b22] border-[#30363d]"
                 )}
@@ -187,7 +196,7 @@ export default function OpenPositions({ activeSymbol }: { activeSymbol?: string 
                   <span className="font-mono">@ ${p.exit_price.toLocaleString()}</span>
                   {p.slippage_pct != null && <span>{p.slippage_pct}% off mark</span>}
                 </div>
-                {p.unrealized > 0 && p.exit_unrealized < 0 && (
+                {(p.unrealized ?? 0) > 0 && p.exit_unrealized < 0 && (
                   <div className="mt-1 flex items-start gap-1 text-[10px] text-amber-300">
                     <AlertTriangle size={11} className="mt-px shrink-0" />
                     <span>Mark shows profit, but the book only fills at a loss.</span>

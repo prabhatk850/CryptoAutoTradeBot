@@ -1,19 +1,4 @@
-"""
-ForexBot MCP server.
-
-Exposes the running ForexBot FastAPI backend as MCP tools so an AI agent
-(Claude Desktop, Claude Code, Cursor, ...) can control and inspect the bot
-in natural language.
-
-This server is a thin client over the HTTP backend — the backend
-(uvicorn main:app) must be running. It does NOT open its own DB connection
-or scheduler, so there is exactly one source of truth.
-
-Run (stdio transport, for Claude Desktop):
-    python mcp_server/server.py
-
-Configure the backend URL with FOREXBOT_API_URL (default http://localhost:8000).
-"""
+"""ForexBot MCP server: thin stdio client over the running backend (set FOREXBOT_API_URL, default http://localhost:8000)."""
 import os
 from typing import Any
 
@@ -45,7 +30,7 @@ async def _request(method: str, path: str, **kwargs) -> Any:
             "error": f"Cannot reach ForexBot backend at {API_URL}. "
                      "Start it with: uvicorn main:app (from the backend/ folder).",
         }
-    except Exception as e:  # pragma: no cover - defensive
+    except Exception as e:
         return {"ok": False, "error": str(e)}
 
 

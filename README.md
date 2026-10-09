@@ -1,185 +1,66 @@
-# ForexBot — Automated Trading Dashboard
+# ForexBot
 
-Paper trading bot using Delta Exchange Testnet, with a Next.js dashboard, Python/FastAPI backend, and MongoDB.
+Crypto-perpetuals trading bot on the Delta Exchange testnet: FastAPI backend, Next.js dashboard, MongoDB (Atlas).
 
-## Stack
-| Layer | Tech |
+## Run
+
+```bash
+cp .env.example .env            # fill in Delta keys, MONGO_URI, an AI key
+docker compose up -d --build    # local dev: base + override (source mounted, hot reload)
+```
+
+- Dashboard: http://localhost:4000 (calls `/api`, proxied server-side to the backend)
+- API docs: http://localhost:8000/docs
+
+| File | Purpose |
 |---|---|
-| Frontend | Next.js 14 + Tailwind + Lightweight Charts |
-| Backend | Python FastAPI + APScheduler |
-| Database | MongoDB (Motor async) |
-| Exchange | Delta Exchange (Testnet) |
+| `docker-compose.yml` | Base stack from published images — what a server runs |
+| `docker-compose.override.yml` | Local dev, merged automatically: builds from source, hot reload |
 
----
-
-## Quick Start (Local)
-
-### 1. Get Delta Exchange Testnet API keys
-1. Go to https://testnet.delta.exchange
-2. Sign up for a free account
-3. Go to **Profile → API Keys → Create Key**
-4. Copy the API key and secret
-
-### 2. Configure environment
-```bash
-cp .env.example .env
-# Edit .env and fill in your DELTA_API_KEY and DELTA_API_SECRET
-```
-
-### 3. Run with Docker (easiest)
-```bash
-docker compose up --build
-```
-- Dashboard: http://localhost:3000
-- API docs:  http://localhost:8000/docs
-
-### 4. Run without Docker
-
-**Backend:**
-```bash
-cd backend
-python -m venv venv
-source venv/bin/activate      # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-uvicorn main:app --reload
-```
-
-**Frontend:**
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-**MongoDB:** Install locally or use MongoDB Atlas free tier (update MONGO_URI in .env).
-
-> **MongoDB Atlas / Delta note:** both lock access to an IP allowlist. If your public IP
-> changes and data stops loading, add the new IP to Atlas → Network Access **and** to the
-> Delta API key's whitelist (or set them unrestricted for testnet).
-
----
-
-## 🤖 AI Brain (Claude-powered SL/TP + analysis)
-
-Each tick, the bot sends a compact **multi-timeframe snapshot** (15m entry + 1h trend
-candles, EMA/RSI/SuperTrend AI/trendline/FVG/IFVG, swing structure, ATR, strategy votes)
-to **Claude**, which returns a structured trade plan: direction, a **structure-based
-stop-loss** (below the invalidating swing / SuperTrend / gap edge — not a fixed distance),
-**TP1/TP2/TP3**, confidence, and written reasoning.
-
-**No Anthropic API key required** — it uses the local **Claude Code CLI** authenticated by
-your Claude subscription (billed against your plan, not per-call). The bot auto-discovers
-the Claude Code binary; set `CLAUDE_CLI_PATH` in `.env` to override.
-
-Guardrails always hold regardless of what the AI says (in code, in `scheduler.py`):
-- Risk-based sizing (0.5–1.5% of account per trade; AI confidence scales it)
-- Stop clamped to `MIN/MAX_SL_PCT`; must be on the correct side of entry
-- First TP must clear the **2R** floor; TPs must be progressive — else the trade is skipped
-- Never trade against the 1h trend; concurrency cap; margin cap
-
-Configure in `.env`:
-```bash
-AI_ENABLED=true
-AI_MODEL=claude-sonnet-5      # or claude-sonnet-5 (cheaper/faster), claude-haiku-4-5-...
-AI_MODE=decide                # decide = AI picks entry+SL+TP · refine = AI sets SL/TP only · advisory = log only
-AI_MIN_CONFIDENCE=0.55        # below this the AI trade becomes HOLD
-CLAUDE_CLI_PATH=              # blank = auto-discover
-```
-If the CLI is missing/times out, the bot cleanly **falls back to the mechanical engine**.
-AI-driven trades show a 🤖 badge in Order History; per-trade reasoning is stored in the log.
-
-### MCP server (chat with the bot from Claude Desktop / Claude Code)
-`mcp_server/server.py` exposes the running backend as MCP tools — `analyze_symbol`,
-`get_indicators`, `get_pnl`, `get_positions`, `recent_trades`, `bot_status`, `start_bot`,
-`stop_bot`. Register it (backend must be running):
+**Server deploy** (only port 4000 needs to be public):
 
 ```bash
-claude mcp add forexbot -- <backend/venv python> <repo>/mcp_server/server.py
-# or paste mcp_server/claude_desktop_config.example.json into your Claude Desktop config
-```
-Then ask: *"analyze BTCUSD right now"*, *"show my open positions and P&L"*.
-The MCP tools are **read-only for the market** (they never place orders directly).
-
----
-
-## How the Bot Works
-
-Every 5 minutes the bot:
-1. Fetches the latest 100 candles from Delta Exchange
-2. Calculates EMA(9), EMA(21), RSI(14), and trendline breakout
-3. Runs the strategy (needs 2/3 signals to agree before trading)
-4. Places a paper trade order via the Testnet API if BUY or SELL
-5. Logs every decision to MongoDB — visible in the dashboard
-
-### Strategy Rules
-| Signal | BUY | SELL |
-|---|---|---|
-| EMA | Fast(9) crosses above Slow(21) | Fast(9) crosses below Slow(21) |
-| RSI | RSI < 30 (oversold) | RSI > 70 (overbought) |
-| Breakout | Price closes above resistance | Price closes below support |
-
-**2 out of 3 signals must agree** to place a trade. Tune this in `backend/bot/strategy.py`.
-
----
-
-## Deploying to Railway (free tier)
-
-1. Push this repo to GitHub
-2. Go to https://railway.app → New Project → Deploy from GitHub
-3. Add 3 services: **MongoDB** (plugin), **backend**, **frontend**
-4. Set environment variables in Railway's dashboard (same as .env)
-5. Done — Railway gives you a public URL
-
-## Deploying to DigitalOcean ($5/month droplet)
-
-```bash
-# On your droplet:
-git clone <your-repo>
-cd forex-bot
-cp .env.example .env && nano .env   # fill in keys
-docker compose up -d --build
+docker compose build && docker compose push                                        # on the dev machine
+docker compose -f docker-compose.yml pull && docker compose -f docker-compose.yml up -d   # on the server
 ```
 
----
+**Gotchas**
+- `.env` is read when a container is *created*: `docker compose up -d --force-recreate backend` after editing it.
+- In dev every saved backend file reloads the **live** bot; add a new module before the line that imports it.
+- Want a local Mongo instead of Atlas? `docker compose --profile localdb up -d` and `MONGO_URI=mongodb://mongodb:27017/forexbot`.
+- Without Docker: `scripts/run_backend.ps1` and `scripts/run_frontend.ps1` (see `scripts/README.md`).
 
-## Going Live (Real Money — Read Carefully)
+## How it trades
 
-When you're ready to trade real money:
-1. Get a **live** Delta Exchange account and API keys
-2. Change `DELTA_BASE_URL` in .env to `https://api.delta.exchange`
-3. Change `paper_trade: True` to `False` in `backend/bot/scheduler.py`
-4. Start with the **smallest position size** allowed
-5. Set a daily loss limit — stop the bot if your account drops 5%
+Two loops in `backend/bot/scheduler.py`:
 
-⚠️ **Paper trade for at least 30 days before going live.**
+- **Deep tick** (`CHECK_INTERVAL_SECONDS`, 120s): for each symbol, analyze 1h (bias) / 15m (decision) / 5m (timing),
+  collect strategy votes (`bot/strategies.py`), ask the AI for a plan (`bot/ai_brain.py`), then run entry guards
+  (position cap, liquidity, news blackout, daily loss, backtested expectancy, real fill R:R) and place a market entry
+  with reduce-only TP/SL stops. Every decision is logged to `trade_logs`.
+- **Fast tick** (`FAST_CHECK_SECONDS`, 15s): manages open positions (breakeven after TP1, cleanup when flat) and fires
+  entries the deep tick *armed* once price crosses the AI's trigger — through the same guarded entry path.
 
----
+Closed trades are scored mark→mark (trains the strategy weights in `bot/autotune.py`) and on real fills
+(execution quality only). See `/bot/training`.
 
-## File Structure
+AI provider chains are constants at the top of `bot/ai_brain.py`. The personal Claude subscription is never used.
+
+## Layout
+
 ```
-forex-bot/
-├── backend/
-│   ├── main.py              ← FastAPI app entry point
-│   ├── config.py            ← All settings from .env
-│   ├── db.py                ← MongoDB connection
-│   ├── bot/
-│   │   ├── delta_client.py  ← Delta Exchange API wrapper
-│   │   ├── indicators.py    ← EMA, RSI, Breakout calculations
-│   │   ├── strategy.py      ← BUY/SELL/HOLD decision logic
-│   │   └── scheduler.py     ← APScheduler bot loop (every 5m)
-│   └── routers/
-│       ├── bot.py           ← /bot/start, /bot/stop, /bot/status
-│       ├── trades.py        ← /trades/logs, /trades/stats
-│       └── market.py        ← /market/ticker, /market/candles
-├── frontend/
-│   ├── app/page.tsx         ← Main dashboard page
-│   ├── components/
-│   │   ├── TradingViewChart.tsx  ← Candlestick chart
-│   │   ├── BotControl.tsx        ← Start/stop bot UI
-│   │   ├── TradeLog.tsx          ← Decision history table
-│   │   ├── StatCard.tsx          ← Metric cards
-│   │   └── IndicatorBar.tsx      ← Live RSI/EMA badges
-│   └── lib/api.ts           ← All API calls
-├── docker-compose.yml
-└── .env.example
+backend/
+  main.py, config.py (every setting + default), db.py
+  bot/       scheduler (loops + execution), ai_brain, strategies, indicators, lux_indicators, smc, swings,
+             divergence, backtest, edge, autotune, funding, orderbook, portfolio_risk, news, delta_client
+  routers/   bot, trades (P/L from real fills), market, news
+  test_real_rr.py
+frontend/    app/page.tsx, components/, lib/api.ts, next.config.mjs (/api proxy)
+mcp_server/  MCP tools over the HTTP API (see its README)
+SKILL.md     rules for failure paths: never fabricate a number
 ```
+
+## Going live
+
+Testnet only today. Going live means a live Delta account and keys, `DELTA_BASE_URL=https://api.delta.exchange`,
+small size, and the daily loss limit on. Paper trade for at least 30 days first.

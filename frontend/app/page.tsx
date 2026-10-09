@@ -82,8 +82,7 @@ export default function Dashboard() {
     return () => { alive = false; clearInterval(iv); };
   }, [chartSymbol, timeframe, showSupertrend, showTrendline, showFvg, showIfvg, showSmc, showMacd, showVolume, showEma200]);
 
-  // bot trades the chart's symbol: switching the chart re-points the bot,
-  // then we refetch the account view for that symbol.
+  // Account view (P/L, orders, markers) for the chart's symbol, refetched on switch.
   useEffect(() => {
     let alive = true;
     const fetchBot = async () => {
@@ -97,8 +96,7 @@ export default function Dashboard() {
         const d = ordersRes.value.data;  // per chart symbol
         setOrders(d.markers ?? []);  // per-fill markers for the chart
         setOpenEntry(d.open_position ? {
-          // chart entry line uses the bot's MARK entry so it aligns with the mark candles
-          // (the fill can differ on the thin testnet); PnL cards still use the real fill.
+          // Entry line uses the bot's mark entry to match mark candles; P/L cards use the real fill.
           side: d.open_side, avg: d.protection?.mark_entry ?? d.open_avg_entry, unrealized: d.open_unrealized,
           sl: d.protection?.sl ?? null, tps: d.protection?.tps ?? [],
         } : null);
@@ -113,10 +111,7 @@ export default function Dashboard() {
     return () => { alive = false; clearInterval(iv); };
   }, [chartSymbol]);
 
-  // MARK price, not `close`. `close` is the last TRADED price, which on this thin
-  // venue prints at stale levels (ETH close 1925 vs mark 1872; BTC 65096 vs 63080).
-  // The chart draws MARK candles and every PnL figure is mark-based, so anything
-  // else here reads as the dashboard disagreeing with itself.
+  // Mark, not `close`: the testnet's last-traded price sits at stale levels and everything else is mark-based.
   const price = Number(ticker?.mark_price ?? ticker?.close ?? 0);
 
   return (

@@ -1,12 +1,6 @@
-"""
-Portfolio-level risk: realized correlation between two traded symbols.
-
-With trade_symbols defaulting to BTCUSD,ETHUSD and max_concurrent_positions=2, both
-can be open same-direction at once — which silently doubles correlated exposure
-rather than diversifying it. This computes realized correlation on demand so the
-sizing step in scheduler.py can dampen (not block) the second same-direction entry.
-"""
+"""Realized correlation between symbols, used to shrink a second same-direction position."""
 from __future__ import annotations
+import asyncio
 import time
 from typing import Optional
 
@@ -15,13 +9,12 @@ import pandas as pd
 from bot.delta_client import DeltaClient
 
 _cache: dict[tuple, tuple[float, Optional[float]]] = {}  # (sym_a, sym_b, tf) -> (ts, corr)
-_TTL = 300.0  # correlation drifts slowly; no need to recompute more than every 5 min
+_TTL = 300.0  # correlation drifts slowly
 
 
 async def realized_correlation(delta: DeltaClient, sym_a: str, sym_b: str,
                                timeframe_min: int, lookback: int = 200) -> Optional[float]:
-    """Pearson correlation of the two symbols' recent bar-over-bar returns, or None
-    if either candle series is unavailable/too short. Cached per symbol pair+timeframe."""
+    """Pearson correlation of bar returns (cached per pair), or None without enough data."""
     a, b = sorted((sym_a.upper(), sym_b.upper()))
     key = (a, b, timeframe_min)
     now = time.time()
@@ -29,8 +22,10 @@ async def realized_correlation(delta: DeltaClient, sym_a: str, sym_b: str,
     if cached and now - cached[0] < _TTL:
         return cached[1]
     try:
-        ca = await delta.get_candles(a, timeframe_min, lookback)
-        cb = await delta.get_candles(b, timeframe_min, lookback)
+        ca, cb = await asyncio.gather(
+            delta.get_candles(a, timeframe_min, lookback),
+            delta.get_candles(b, timeframe_min, lookback),
+        )
     except Exception:
         return cached[1] if cached else None
     if len(ca) < 20 or len(cb) < 20:

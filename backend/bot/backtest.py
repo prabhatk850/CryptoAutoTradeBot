@@ -1,31 +1,18 @@
-"""
-Backtest engine — replays historical candles through the SAME strategy votes
-and the multi-timeframe (1h trend filter + entry) logic, simulating trades with
-an ATR stop and a fixed reward:risk, no pyramiding. Reports per-strategy and
-combined performance so you can see which strategies actually have an edge.
-
-Simplifications vs live trading (kept representative, not 1:1):
-  - Fixed reward:risk (settings.risk_reward) instead of structure-snapped partials
-  - ATR-based stop (the most universal of the live SL methods)
-  - One position at a time; exit on SL / TP / opposite signal
-"""
+"""Backtest: replay per-bar strategy votes with the 1h filter, ATR stop and fixed R:R (one position at a time)."""
 import math
 import pandas as pd
 
 from bot.indicators import (
-    calc_ema, calc_rsi, calc_macd, candles_to_df, calc_bollinger, calc_keltner, calc_squeeze, calc_adx,
+    calc_atr, calc_ema, calc_rsi, candles_to_df, calc_bollinger, calc_keltner, calc_squeeze, calc_adx,
 )
-from bot.lux_indicators import (
-    supertrend_ai, trendline_breakout_navigator, fair_value_gaps, inverse_fvg, _atr,
-)
-from bot import strategies
-from bot import smc as smc_mod
-from bot import divergence as divergence_mod
+from bot.lux_indicators import supertrend_ai, trendline_breakout_navigator, fair_value_gaps, inverse_fvg
+from bot.swings import find_swings
+from bot import strategies, smc, divergence
 from config import settings
 
 
 def _per_bar_votes(candles: list[dict]) -> dict[str, list[int]]:
-    """Return per-bar directional vote (+1/-1/0) for each strategy id."""
+    """Per-bar vote (+1/-1/0) for every strategy id."""
     n = len(candles)
     closes = [c["close"] for c in candles]
     highs = [c["high"] for c in candles]
@@ -54,14 +41,14 @@ def _per_bar_votes(candles: list[dict]) -> dict[str, list[int]]:
         if i is not None:
             ifvg_dir[i] = 1 if sig["dir"] == "long" else -1
 
-    # MACD (12/26/9) histogram sign per bar
+    # MACD (12/26/9) histogram
     macd_hist = (calc_ema(s, 12) - calc_ema(s, 26))
     macd_hist = (macd_hist - calc_ema(macd_hist, 9)).tolist()
 
-    # SMC per-bar structural trend, derived from BOS/CHoCH breaks (one O(n) pass)
+    # SMC trend per bar from BOS/CHoCH breaks
     smc_trend = [0] * n
     try:
-        brks = sorted(smc_mod._breaks(candles, smc_mod._swings(candles)), key=lambda e: e["i"])
+        brks = sorted(smc.breaks(candles, find_swings(candles)), key=lambda e: e["i"])
         t, bi = 0, 0
         for i in range(n):
             while bi < len(brks) and brks[bi]["i"] <= i:
@@ -71,25 +58,17 @@ def _per_bar_votes(candles: list[dict]) -> dict[str, list[int]]:
     except Exception:
         pass
 
-    # Volatility squeeze breakout (BB inside KC, then release) — vectorized over
-    # the whole series so it can be replayed bar-by-bar like every other strategy.
+    # Squeeze (BB inside KC) series, replayed bar by bar below
     df = candles_to_df(candles)
     bb_mid, bb_upper, bb_lower = calc_bollinger(s, settings.bb_period, settings.bb_mult)
     kc_mid, kc_upper, kc_lower = calc_keltner(df, candles, settings.kc_period, settings.kc_atr_mult, settings.kc_atr_len)
     squeeze_l = calc_squeeze(bb_upper, bb_lower, kc_upper, kc_lower).tolist()
     bb_mid_l = bb_mid.tolist()
 
-    # ADX — used below both for the COMBINED_ADX_GATED A/B and available per-bar
-    # for any strategy (VOL_SQUEEZE_BREAKOUT's live conviction scaling is skipped
-    # here; backtest votes are directional only, same simplification as every
-    # other strategy's strength here).
-    adx_l = calc_adx(df, settings.adx_period)[0].tolist()
-
-    # RSI/price divergence: map each confirmed swing signal onto the earliest bar
-    # it is actually knowable (sig["i"] + right) — no lookahead.
+    # Divergence lands on the first bar it is knowable (swing + right) — no lookahead
     div_dir = [0] * n
     try:
-        dres = divergence_mod.detect_divergence(candles, settings.divergence_swing_left, settings.divergence_swing_right)
+        dres = divergence.detect_divergence(candles, settings.divergence_swing_left, settings.divergence_swing_right)
         for sig in (dres or {}).get("signals", []):
             bar = min(n - 1, sig["i"] + settings.divergence_swing_right)
             div_dir[bar] = 1 if sig["dir"] == "bullish" else -1
@@ -125,14 +104,12 @@ def _per_bar_votes(candles: list[dict]) -> dict[str, list[int]]:
             v["VOL_SQUEEZE_BREAKOUT"][i] = 1 if (bm is not None and closes[i] > bm) else -1
         squeeze_prev = sq_now
         v["DIVERGENCE"][i] = div_dir[i]
-        # FUNDING_BIAS / ORDERBOOK_IMBALANCE are intentionally NOT backtestable here —
-        # no stored history for either exists; they're validated live via shadow mode
-        # (see autotune.shadow_status / GET /bot/performance/shadow) instead.
+        # FUNDING_BIAS / ORDERBOOK_IMBALANCE have no history; they're validated live in shadow mode.
     return v
 
 
 def _trend_bias_series(candles: list[dict]) -> list[int]:
-    """Per-bar 1h-style bias (+1/-1/0) from EMA + SuperTrend + Trendline."""
+    """Per-bar bias (+1/-1/0) from EMA + SuperTrend + Trendline."""
     n = len(candles)
     closes = [c["close"] for c in candles]
     s = pd.Series(closes)
@@ -154,8 +131,7 @@ def _trend_bias_series(candles: list[dict]) -> list[int]:
 
 
 def _simulate(candles, entry_dir, bias, atr, rr, atr_k, use_bias):
-    """Walk bars; enter when entry_dir[i] != 0 and (optionally) agrees with 1h bias;
-    exit on ATR stop / RR target / opposite signal. Returns trade R-multiples."""
+    """Trade R-multiples: enter on a vote that agrees with bias, exit on stop / target / opposite vote."""
     n = len(candles)
     closes = [c["close"] for c in candles]
     highs = [c["high"] for c in candles]
@@ -202,7 +178,6 @@ def _metrics(trades: list[float]) -> dict:
     losses = [r for r in trades if r <= 0]
     gross_win = sum(wins)
     gross_loss = abs(sum(losses))
-    # equity curve in R for max drawdown
     eq = 0.0
     peak = 0.0
     max_dd = 0.0
@@ -223,12 +198,7 @@ def _metrics(trades: list[float]) -> dict:
 
 def run_backtest(candles_entry: list[dict], candles_trend: list[dict],
                  rr: float = None, atr_k: float = None, adx_gate_min: float = None) -> dict:
-    """Backtest each strategy standalone + the combined engine.
-
-    `adx_gate_min`, when given, also reports a COMBINED_ADX_GATED row that blocks
-    entries wherever the 1h ADX was below the threshold — a direct before/after
-    comparison to decide config.adx_gate_enabled's default (see config.adx_min_trend).
-    """
+    """Each strategy alone plus COMBINED; `adx_gate_min` adds a COMBINED_ADX_GATED row for comparison."""
     rr = rr or settings.risk_reward
     atr_k = atr_k or settings.atr_k
     n = len(candles_entry)
@@ -236,11 +206,11 @@ def run_backtest(candles_entry: list[dict], candles_trend: list[dict],
         return {"error": "not enough candles"}
 
     votes = _per_bar_votes(candles_entry)
-    atr = _atr(candles_entry, settings.atr_period)
+    atr = calc_atr(candles_entry, settings.atr_period)
 
-    # map each entry bar to the most recent completed trend (1h) bar's bias / ADX
+    # Map each entry bar to the latest trend bar's bias / ADX
     trend_bias = _trend_bias_series(candles_trend)
-    trend_adx = calc_adx(candles_to_df(candles_trend), settings.adx_period)[0].tolist()
+    trend_adx = calc_adx(candles_to_df(candles_trend), settings.adx_period).tolist()
     t_times = [int(c["time"]) for c in candles_trend]
     bias_at = [0] * n
     adx_at = [0.0] * n
@@ -253,12 +223,10 @@ def run_backtest(candles_entry: list[dict], candles_trend: list[dict],
         adx_at[i] = trend_adx[j] if t_times and t_times[j] <= tt else 0.0
 
     results = {}
-    # per-strategy (standalone, with 1h filter)
     for sid in strategies.StrategyId:
         trades = _simulate(candles_entry, votes[sid.value], bias_at, atr, rr, atr_k, use_bias=True)
         results[sid.value] = _metrics(trades)
 
-    # combined engine (>= min_signals agreeing, 1h filter)
     enabled = strategies.parse_enabled(settings.strategies)
     combined_dir = [0] * n
     for i in range(n):
