@@ -1,12 +1,14 @@
 """Trading loops: `bot_tick` (deep analysis + entries) and `fast_tick` (position upkeep + armed triggers)."""
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from bot import strategies, autotune, ai_brain, smc, edge, news, funding, orderbook, portfolio_risk
+from bot import strategies, autotune, ai_brain, smc, edge, news, funding, orderbook, portfolio_risk, ensemble
+from bot.agents import AgentContext
 from bot.delta_client import DeltaClient, vwap_fill
 from bot.divergence import detect_divergence
 from bot.indicators import calc_atr, compute_indicators
@@ -22,6 +24,7 @@ _bot_running = False
 _delta = DeltaClient()
 _tick_lock = asyncio.Lock()       # held by bot_tick for its whole pass; fast_tick never interleaves orders
 _watch: dict[str, dict] = {}      # symbol -> armed fast-loop trigger {side, trigger, confidence, armed_at, expires}
+_last_ai_call: dict[str, float] = {}  # symbol -> monotonic time of the last deep-pass AI call
 BIAS_TXT = {1: "bullish", -1: "bearish", 0: "neutral"}
 
 
@@ -386,12 +389,14 @@ async def _attribute_closed_trade(symbol: str, state: dict) -> None:
     try:
         await autotune.record_outcome(state.get("votes") or {}, o["side"], train_r)
         await autotune.record_shadow_outcome(state.get("shadow_votes") or {}, o["side"], train_r)
+        await ensemble.record_outcome(state.get("agents") or [], train_r)
     except Exception as e:
         logger.error(f"attribution error: {e}")
         return
     logger.info(f"{symbol} closed — strategy {o['strategy_pnl']:+.2f} ({o['strategy_r']:+.2f}R) "
                 f"| execution {o['execution_pnl']:+.2f} ({o['execution_r']:+.2f}R) "
-                f"| slippage {o['slippage_cost']:+.2f} → attributed to {o['side']} voters")
+                f"| slippage {o['slippage_cost']:+.2f} → attributed to {o['side']} voters"
+                + (f" + agents {state['agents']}" if state.get("agents") else ""))
 
 
 async def _manage_open_position(symbol: str):
@@ -502,6 +507,30 @@ async def _analyze_symbol(symbol: str, fast: bool) -> dict | None:
             "funding": funding_read, "orderbook": orderbook_read, "bias": trend_bias(trend)}
 
 
+async def _ask_agents(symbol: str, a: dict, result: dict) -> dict | None:
+    """Learning-ensemble decision over the book-derived agents (see bot/ensemble.py)."""
+    e = a["entry"]
+    try:
+        return await ensemble.decide(AgentContext(
+            symbol=symbol, price=e["ind"]["close"], c_entry=e["candles"], c_trend=a["trend"]["candles"],
+            ind=e["ind"], supertrend=e["st"], trendline=e["tn"], fvg=e["fvg"], ifvg=e["ifvg"],
+            smc=e["smc"], smc_trend=a["trend"]["smc"], bias=a["bias"], confluence=result))
+    except Exception as ex:
+        logger.error(f"[{symbol}] agent ensemble failed: {ex}")
+        return None
+
+
+def _ai_due(symbol: str, fast: bool) -> bool:
+    """Fast passes may always ask; the deep pass at most once per ai_min_interval_sec per symbol."""
+    if fast:
+        return True
+    now = time.monotonic()
+    if now - _last_ai_call.get(symbol, float("-inf")) < settings.ai_min_interval_sec:
+        return False
+    _last_ai_call[symbol] = now
+    return True
+
+
 async def _ask_ai(symbol: str, a: dict, votes: dict, weights: dict | None, fast: bool) -> dict | None:
     """AI plan; the fast pass sends a lean snapshot (no edge/news) to fast providers."""
     chain = ai_brain.FAST_PROVIDERS if fast else ai_brain.DEFAULT_PROVIDERS
@@ -520,7 +549,7 @@ async def _ask_ai(symbol: str, a: dict, votes: dict, weights: dict | None, fast:
 
 
 async def _decide(symbol: str, a: dict, result: dict, weights: dict | None, fast: bool) -> dict:
-    """Mechanical vote filtered by 1h trend + ADX, then (in decide/refine mode) the AI's call."""
+    """Votes filtered by 1h trend + ADX, then the agent ensemble; the AI decides only if the agents abstain."""
     bias, bias_txt = a["bias"], BIAS_TXT[a["bias"]]
     adx_now = a["trend"]["ind"].get("adx")
     adx_blocks = bool(settings.adx_gate_enabled and adx_now is not None and adx_now < settings.adx_min_trend)
@@ -536,7 +565,19 @@ async def _decide(symbol: str, a: dict, result: dict, weights: dict | None, fast
     else:
         reason = f"1h trend {bias_txt} | {result['reason']}"
 
-    ai_plan = await _ask_ai(symbol, a, result["votes"], weights, fast)
+    ens = await _ask_agents(symbol, a, result)
+    agent_drove = False
+    if ens and ens["action"] in ("BUY", "SELL"):
+        cand = ens["action"]
+        if settings.ai_respect_trend_filter and ((cand == "BUY" and bias < 0) or (cand == "SELL" and bias > 0)):
+            action, reason = "HOLD", f"Agents wanted {cand} but blocked by 1h {bias_txt} trend | {ens['reason']}"
+        elif adx_blocks:
+            action, reason = "HOLD", f"Agents wanted {cand} but blocked by {adx_txt} | {ens['reason']}"
+        else:
+            action, agent_drove, reason = cand, True, f"{ens['reason']} · 1h {bias_txt}"
+
+    ai_asked = not agent_drove and _ai_due(symbol, fast)
+    ai_plan = await _ask_ai(symbol, a, result["votes"], weights, fast) if ai_asked else None
     ai_drove = False
     if ai_plan and settings.ai_mode == "decide":
         cand = ai_plan["action"]
@@ -559,10 +600,19 @@ async def _decide(symbol: str, a: dict, result: dict, weights: dict | None, fast
         ai_meta = {"via": ai_plan.get("via"), "mode": settings.ai_mode, "drove": ai_drove,
                    "proposed_action": ai_plan["action"],
                    **{k: ai_plan[k] for k in ("confidence", "reasoning", "invalidation", "stop_loss", "take_profits")}}
+    agent_meta = None
+    if ens:
+        agent_meta = {"decision": ens["action"], "drove": agent_drove,
+                      **{k: ens[k] for k in ("confidence", "size_mult", "agents", "proposals", "reason")}}
     logger.info(f"[{symbol}] {action} (1h bias={bias_txt}, votes={result['votes']}, "
+                f"agents={'drove' if agent_drove else (ens['action'] if ens else 'off')}, "
                 f"ai={'on ' + format(ai_plan['confidence'], '.0%') if ai_plan else 'off'})")
     return {"action": action, "reason": reason, "entry_action": entry_action,
-            "ai_plan": ai_plan, "ai_drove": ai_drove, "ai_meta": ai_meta}
+            "ai_plan": ai_plan, "ai_drove": ai_drove, "ai_meta": ai_meta, "ai_asked": ai_asked,
+            "agent_drove": agent_drove, "agent_meta": agent_meta,
+            "agent_ids": ens["agents"] if agent_drove else [],
+            "agent_size_mult": ens["size_mult"] if agent_drove else 1.0,
+            "agent_sl_hint": ens["sl_hint"] if agent_drove else None}
 
 
 async def _entry_gates(symbol: str, action: str, want_long: bool, votes: dict, weights: dict | None,
@@ -606,9 +656,10 @@ async def _entry_gates(symbol: str, action: str, want_long: bool, votes: dict, w
     return balance, avail
 
 
-async def _margin_pct(symbol: str, want_long: bool, big: bool, price: float, c_entry: list) -> float:
-    """% of balance used as margin: base (normal/big), damped for a correlated open position, scaled by volatility."""
-    cap_pct = settings.big_trade_capital_pct if big else settings.position_capital_pct
+async def _margin_pct(symbol: str, want_long: bool, big: bool, price: float, c_entry: list,
+                      size_mult: float = 1.0) -> float:
+    """% of balance used as margin: base (normal/big) × agent size, damped if correlated, scaled by volatility."""
+    cap_pct = (settings.big_trade_capital_pct if big else settings.position_capital_pct) * size_mult
     if settings.correlation_check_enabled:
         try:
             for p in await _delta.get_positions():
@@ -645,15 +696,20 @@ async def _open_trade(symbol: str, a: dict, d: dict, votes_result: dict, weights
     agree = votes_result["buy_score"] if want_long else votes_result["sell_score"]
     big = agree / max(len(strategies.parse_enabled(settings.strategies)), 1) >= settings.big_trade_min_agree
 
-    # Stop: the AI's structure stop (clamped) when it drove the call, else ATR/SuperTrend/structure.
+    # Stop: the driver's structure stop (AI or agents, clamped), else ATR/SuperTrend/structure.
     sl = sl_method = None
     if ai_drove and ai_plan:
         sl = _clamp_sl(want_long, price, ai_plan.get("stop_loss"))
         sl_method = "ai" if sl is not None else None
+    elif d["agent_drove"] and d["agent_sl_hint"] is not None:
+        sl = _clamp_sl(want_long, price, d["agent_sl_hint"])
+        sl_method = "agent" if sl is not None else None
     if sl is None:
         sl, sl_method = _combined_sl(want_long, price, c_entry, entry_tf["st"])
         if ai_drove:
             sl_method += "+ai-fallback"
+        elif d["agent_drove"]:
+            sl_method += "+agent-fallback"
     prof = _symbol_profile(symbol, big)
     if prof:  # ETH: clamp stop distance to the point band
         dist = min(max(abs(price - sl), prof["sl_min"]), prof["sl_max"])
@@ -670,7 +726,7 @@ async def _open_trade(symbol: str, a: dict, d: dict, votes_result: dict, weights
     cv = await _delta.get_contract_value(symbol)
     lev = _safe_leverage(price, risk)
     await _delta.set_leverage(symbol, lev)
-    cap_pct = await _margin_pct(symbol, want_long, big, price, c_entry)
+    cap_pct = await _margin_pct(symbol, want_long, big, price, c_entry, d["agent_size_mult"])
     margin = min(balance * cap_pct / 100.0, avail * settings.margin_cap_pct)
     lots = t["lots"] = max(int(margin * lev / (price * cv)) if price > 0 and cv > 0 else 0, 1)
     t["fraction"] = round(cap_pct, 2)
@@ -734,7 +790,8 @@ async def _open_trade(symbol: str, a: dict, d: dict, votes_result: dict, weights
     await db.bot_state.replace_one({"_id": symbol}, {
         "_id": symbol, "side": side, "size": lots, "entry": price, "fill_price": fill_price,
         "sl": sl, "tps": placed_tps, "rr": rr, "be_moved": False,
-        "votes": votes_result["votes"], "shadow_votes": votes_result.get("shadow_votes") or {},
+        "votes": votes_result["votes"], "agents": d["agent_ids"],
+        "shadow_votes": votes_result.get("shadow_votes") or {},
         "risk_dollars": round(risk_dollars, 4), "sl_method": sl_method, "tp_source": tp_source, "ai": d["ai_meta"],
         "leverage": lev, "big_trade": big, "capital_pct": cap_pct, "opened_at": datetime.now(timezone.utc),
     }, upsert=True)
@@ -815,6 +872,7 @@ def _log_doc(symbol: str, a: dict, d: dict, result: dict, t: dict) -> dict:
                    "stop_loss": round(t["sl_price"], 2) if t["sl_price"] else None,
                    "take_profit": round(t["tp_price"], 2) if t["tp_price"] else None},
         "ai": d["ai_meta"],
+        "agents": d["agent_meta"],
         "liquidity": t["liq_meta"],
         "expectancy_gate": t["expectancy_meta"],
         "order_id": t["order_id"],
@@ -847,8 +905,9 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                 held = await _delta.get_position_size(symbol)
             except Exception:
                 held = 0
-            _update_watch(symbol, d["ai_plan"], entry["ind"]["close"], a["timing"]["candles"],
-                          allow_entry=allow_entry, in_position=bool(held))
+            if held or d["ai_asked"]:  # AI on cooldown: keep the current watch (it has its own TTL)
+                _update_watch(symbol, d["ai_plan"], entry["ind"]["close"], a["timing"]["candles"],
+                              allow_entry=allow_entry, in_position=bool(held))
     except Exception as e:
         logger.exception(f"[{symbol}] process error: {e}")
 

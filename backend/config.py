@@ -76,12 +76,35 @@ class Settings(BaseSettings):
     weight_min: float = 0.3
     weight_max: float = 2.0
 
+    # --- Agents + learning ensemble (primary decision-maker; see .claude/skills/trading-books) ---
+    agents_enabled: bool = True
+    agents: str = "MOMENTUM,MEAN_REVERSION,SMC_AGENT,CONFLUENCE"
+    agents_min_confidence: float = 0.55        # meta-label take threshold; below it the AI fallback decides
+    agents_min_trades: int = 12                # pooled closed trades before half-Kelly can cap size
+    agents_agreement_bonus: float = 0.03       # + per extra agreeing agent
+    agents_opposition_penalty: float = 0.10    # − × opposing/winning pooled mass
+    agents_size_min_mult: float = 0.5          # margin multiplier band from win probability
+    agents_size_max_mult: float = 1.5
+    agent_conf_min: float = 0.55               # raw agent confidence band (before learning)
+    agent_conf_max: float = 0.95
+    agents_beta_prior: float = 1.0             # Beta prior on each agent's win rate (starts at 0.5)
+    agents_r_history: int = 50                 # R-multiples kept per agent for Kelly
+    agent_hurst_mr_max: float = 0.5            # mean-reversion only when Hurst < this
+    agent_mr_z_entry: float = 1.5              # |z| that counts as stretched
+    agent_mr_min_lookback: int = 10            # z-score window clamp (half-life picks within)
+    agent_mr_max_lookback: int = 60
+    agent_mr_min_bars: int = 40
+    agent_hurst_trend_min: float = 0.5         # momentum only when Hurst >= this (or unknown)
+    agent_mom_lookback: int = 20               # momentum return + Donchian window
+    agent_mom_full_return: float = 0.02        # |return| counted as full momentum strength
+
     # --- AI brain: providers (chains live in bot/ai_brain.py) ---
     ai_enabled: bool = True
     ai_mode: str = "decide"                    # decide | refine (AI sets SL/TP only) | advisory
     ai_model: str = "claude-sonnet-5"          # model for the `cli` rung
     ai_min_confidence: float = 0.55            # below this an AI trade becomes HOLD
     ai_timeout_sec: int = 150
+    ai_min_interval_sec: int = 300             # deep-loop AI fallback at most this often per symbol (0 = every tick)
     ai_respect_trend_filter: bool = True       # block AI trades against the 1h trend
     ai_allow_subscription_cli: bool = False    # never spend the personal Claude subscription
     subscription_cli_daily_call_cap: int = 200

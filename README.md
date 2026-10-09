@@ -35,7 +35,8 @@ docker compose -f docker-compose.yml pull && docker compose -f docker-compose.ym
 Two loops in `backend/bot/scheduler.py`:
 
 - **Deep tick** (`CHECK_INTERVAL_SECONDS`, 120s): for each symbol, analyze 1h (bias) / 15m (decision) / 5m (timing),
-  collect strategy votes (`bot/strategies.py`), ask the AI for a plan (`bot/ai_brain.py`), then run entry guards
+  collect strategy votes (`bot/strategies.py`), let the learning agent ensemble decide (`bot/ensemble.py`;
+  the AI in `bot/ai_brain.py` is a fallback, at most every `AI_MIN_INTERVAL_SEC`), then run entry guards
   (position cap, liquidity, news blackout, daily loss, backtested expectancy, real fill R:R) and place a market entry
   with reduce-only TP/SL stops. Every decision is logged to `trade_logs`.
 - **Fast tick** (`FAST_CHECK_SECONDS`, 15s): manages open positions (breakeven after TP1, cleanup when flat) and fires

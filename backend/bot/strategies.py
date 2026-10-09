@@ -35,6 +35,7 @@ class StrategyId(str, Enum):
 class Signal:
     action: Action
     reason: str = ""
+    strength: float = 1.0                          # conviction; only SMC sets it (read by agents.SMCAgent)
 
 
 @dataclass
@@ -186,9 +187,9 @@ def _smc(ctx: StrategyContext) -> Signal:
     if any(not o.get("mitigated") for o in obs.get("bearish", [])): bear += 1; reasons.append("bear OB")
 
     if bull >= 2 and bull > bear and htf != "bearish":
-        return Signal(Action.BUY, "SMC bullish: " + ", ".join(reasons))
+        return Signal(Action.BUY, "SMC bullish: " + ", ".join(reasons), min(1.6, 1.0 + 0.15 * bull))
     if bear >= 2 and bear > bull and htf != "bullish":
-        return Signal(Action.SELL, "SMC bearish: " + ", ".join(reasons))
+        return Signal(Action.SELL, "SMC bearish: " + ", ".join(reasons), min(1.6, 1.0 + 0.15 * bear))
     return NEUTRAL
 
 

@@ -82,6 +82,19 @@ export default function Dashboard() {
     return () => { alive = false; clearInterval(iv); };
   }, [chartSymbol, timeframe, showSupertrend, showTrendline, showFvg, showIfvg, showSmc, showMacd, showVolume, showEma200]);
 
+  // Live mark every second so the forming candle moves (backend caches tickers for 3s).
+  useEffect(() => {
+    let alive = true;
+    const tickLive = async () => {
+      try {
+        const { data } = await getTicker(chartSymbol);
+        if (alive && data) setTicker(data);
+      } catch { /* transient ticker errors */ }
+    };
+    const iv = setInterval(tickLive, 1_000);
+    return () => { alive = false; clearInterval(iv); };
+  }, [chartSymbol]);
+
   // Account view (P/L, orders, markers) for the chart's symbol, refetched on switch.
   useEffect(() => {
     let alive = true;
@@ -185,6 +198,7 @@ export default function Dashboard() {
               <TradingViewChart
                 candles={candles}
                 symbol={chartSymbol}
+                livePrice={price}
                 orders={orders}
                 openEntry={chartSymbol === botSymbol ? openEntry : null}
                 supertrend={supertrend}

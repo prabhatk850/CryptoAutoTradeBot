@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 from bot.scheduler import start_bot, stop_bot, bot_status
 from bot.delta_client import DeltaClient
 from bot.backtest import run_backtest
-from bot import strategies, autotune
+from bot import strategies, autotune, ensemble
 from config import settings
 from db import db
 
@@ -48,8 +48,10 @@ async def backtest(symbol: str = None, bars: int = 1500, adx_gate_min: float = N
 
 @router.get("/performance")
 async def performance():
-    """Live per-strategy performance + the auto-tuned vote weights."""
-    return await autotune.status()
+    """Live performance: per-strategy auto-tuned vote weights + the learning agents'
+    win-rates/reliability (the book-derived agents that now drive the decisions)."""
+    strat, agents = await asyncio.gather(autotune.status(), ensemble.status())
+    return {**strat, "agents": agents}
 
 
 @router.get("/performance/shadow")
