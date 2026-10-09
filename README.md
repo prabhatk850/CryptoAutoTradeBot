@@ -42,6 +42,22 @@ Two loops in `backend/bot/scheduler.py`:
 - **Fast tick** (`FAST_CHECK_SECONDS`, 15s): manages open positions (breakeven after TP1, cleanup when flat) and fires
   entries the deep tick *armed* once price crosses the AI's trigger — through the same guarded entry path.
 
+**3-5-7 rule** (`RULE_357_ENABLED`): each trade risks ≤ 3% of balance, all open trades ≤ 5% (size is cut to fit,
+or the entry is skipped), and once realized P/L since 6PM IST reaches +7% the bot stops for the day. Pressing Start
+overrides that for the session; every day at 6PM IST the session resets and the bot auto-starts.
+
+**Trailing stop** (`TRAIL_*`): at 50% of the way to TP1 the stop moves to entry + round-trip fees; once TP1
+fills it locks 50% of TP1's profit. It only ever tightens, the new stop is placed before the old one is cancelled,
+and each move is logged as `trail SL [why] prev → new`.
+
+**Risk engine** (`bot/risk_engine.py`): every verified closed trade is stored with its 1m mark path (`trade_paths`).
+At each 6PM IST reset (or `POST /bot/risk-engine/train`) it replays them under different trail settings and
+adopts the best once 20+ trades back it. It also sets per-trade risk by half-Kelly, never above the 3% cap.
+Results appear under `risk_engine` in `/bot/training`.
+
+**Fresh stats**: `docker exec forex_backend python reset_stats.py` (dry run) then `--yes`. This wipes logs,
+outcomes and learning, keeps open positions, and makes the dashboard ignore Delta fills before the cutoff.
+
 Closed trades are scored mark→mark (trains the strategy weights in `bot/autotune.py`) and on real fills
 (execution quality only). See `/bot/training`.
 

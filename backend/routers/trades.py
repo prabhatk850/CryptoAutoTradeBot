@@ -24,6 +24,7 @@ _LAST_MARK: dict[str, tuple[float, float]] = {}    # symbol -> (seen_at, price)
 _DECISIONS_TTL = 300.0
 _DECISIONS_CACHE: dict[str, object] = {"ts": 0.0, "data": []}
 _decisions_task: asyncio.Task | None = None
+_RESET = {"ts": 0.0, "at": None}                   # stats reset cutoff (bot_meta "account"), cached 60s
 # Only what _humanize_reason reads — full log docs are ~2KB each and stalled /pnl for ~9s.
 _DECISION_FIELDS = {
     "timestamp": 1, "action": 1, "reason": 1,
@@ -211,8 +212,20 @@ async def _build_view(symbol: str) -> dict:
         return view
 
 
+async def _reset_at() -> datetime | None:
+    """Fills before this were wiped from stats by reset_stats.py (Delta's own history can't be deleted)."""
+    if time.time() - _RESET["ts"] > 60:
+        try:
+            doc = await db.bot_meta.find_one({"_id": "account"}) or {}
+            _RESET.update(ts=time.time(), at=_parse_dt(doc["reset_at"]) if doc.get("reset_at") else None)
+        except Exception:
+            pass
+    return _RESET["at"]
+
+
 async def _compute_view(symbol: str) -> dict:
     cv = await _delta.get_contract_value(symbol)
+    reset_at = await _reset_at()
     ticker_r, positions_r, fills_r, decisions_r, orders_r = await asyncio.gather(
         _delta.get_ticker(symbol), _delta.get_positions(), _delta.get_fills(page_size=400),
         _decision_index(), _delta.get_live_orders(symbol), return_exceptions=True)
@@ -253,9 +266,9 @@ async def _compute_view(symbol: str) -> dict:
     for f in fills:
         if f.get("product_symbol") and f["product_symbol"] != symbol:
             continue
-        qty, price = float(f.get("size") or 0), float(f.get("price") or 0)
-        if qty > 0 and price > 0:
-            trades.append({"ts": _parse_dt(f.get("created_at")), "side": 1 if str(f.get("side", "")).lower() == "buy" else -1,
+        qty, price, ts = float(f.get("size") or 0), float(f.get("price") or 0), _parse_dt(f.get("created_at"))
+        if qty > 0 and price > 0 and (reset_at is None or ts >= reset_at):
+            trades.append({"ts": ts, "side": 1 if str(f.get("side", "")).lower() == "buy" else -1,
                            "qty": qty, "price": price, "commission": float(f.get("commission") or 0)})
     trades.sort(key=lambda x: x["ts"])
     if not current_price and trades:

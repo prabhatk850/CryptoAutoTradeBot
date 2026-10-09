@@ -213,6 +213,10 @@ class DeltaClient:
         """Numeric product id every order call needs; None if never learned."""
         return await self._product_fact(symbol, "product_id", "id", int)
 
+    async def get_taker_fee(self, symbol: str) -> Optional[float]:
+        """Taker commission rate (e.g. 0.0005), or None if never learned."""
+        return await self._product_fact(symbol, "taker_fee", "taker_commission_rate", float)
+
     async def get_contract_value(self, symbol: str) -> float:
         """Underlying units per contract (scales P/L to USD). RAISES if unknown — a guess was 10x off once."""
         cv = await self._product_fact(symbol, "contract_value", "contract_value", float)

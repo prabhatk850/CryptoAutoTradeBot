@@ -49,6 +49,23 @@ class Settings(BaseSettings):
     stop_loss_pct: float = 1.0                 # fallback stop distance when no SL candidate exists
     risk_reward: float = 2.0                   # minimum reward:risk floor
     daily_loss_limit_pct: float = 10.0         # stop new entries after this daily realized loss (0 = off)
+    # 3-5-7 rule: ≤3% risk per trade, ≤5% risk across open trades, bot stops for the day at +7%.
+    rule_357_enabled: bool = True
+    max_trade_risk_pct: float = 3.0
+    max_open_risk_pct: float = 5.0
+    daily_profit_target_pct: float = 7.0       # of the session's starting balance; manual Start overrides it
+    session_reset_hour_ist: int = 18           # daily session reset + bot auto-start, IST
+    # Trailing stop: breakeven(+fees) at trigger × the way to TP1, lock × TP1 profit once TP1 fills.
+    trail_enabled: bool = True
+    trail_trigger_frac: float = 0.5
+    trail_lock_frac: float = 0.5
+    trail_be_buffer_pct: float = 0.02          # extra margin above round-trip fees, % of entry
+    trail_fee_fallback_pct: float = 0.05       # taker fee % if Delta's product rate is unavailable
+    # Risk engine: replays closed trades to tune trail params + per-trade risk (never above max_trade_risk_pct).
+    risk_engine_enabled: bool = True
+    risk_engine_min_trades: int = 20
+    risk_engine_min_gain_r: float = 0.05       # adopt new params only if this much better (R)
+    risk_engine_min_risk_pct: float = 0.5
     # ETH uses point-based SL/TP bands instead of percentages.
     eth_sl_min_pts: float = 5.0
     eth_sl_max_pts: float = 20.0

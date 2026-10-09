@@ -22,6 +22,7 @@ turns that outage into silent corruption.
 | `cancel_order` | `{}`, status unchecked | orphan stop shown as the current SL | `cancel_order` raises |
 | brief providers | cached brief as fresh, HTTP 200 | week-old brief looked current | `/news/brief` returns `stale: true` |
 | `get_position` after entry | `fill_price = mark` | fake "zero slippage" fill | `fill_price = None` |
+| `get_positions` in `reset_stats.py` | (refuses) | — | a 502 aborts the reset instead of assuming "flat" |
 | `docker push \| tail` | `tail`'s exit code | "ALL PUSHED" while two tags failed | check the real status |
 
 ## Rules

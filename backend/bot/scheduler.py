@@ -5,9 +5,11 @@ import time
 from datetime import datetime, timezone, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from bot import strategies, autotune, ai_brain, smc, edge, news, funding, orderbook, portfolio_risk, ensemble
+from bot import risk_engine
 from bot.agents import AgentContext
 from bot.delta_client import DeltaClient, vwap_fill
 from bot.divergence import detect_divergence
@@ -26,6 +28,10 @@ _tick_lock = asyncio.Lock()       # held by bot_tick for its whole pass; fast_ti
 _watch: dict[str, dict] = {}      # symbol -> armed fast-loop trigger {side, trigger, confidence, armed_at, expires}
 _last_ai_call: dict[str, float] = {}  # symbol -> monotonic time of the last deep-pass AI call
 BIAS_TXT = {1: "bullish", -1: "bearish", 0: "neutral"}
+IST = timezone(timedelta(hours=5, minutes=30))  # fixed offset: India has no DST
+_stop_reason: str | None = None
+_rule = {"session": None, "realized": 0.0, "target": 0.0, "hit": False}  # last 3-5-7 daily check
+_override: dict = {"session": None, "loaded": False}  # session the user manually restarted in
 
 
 class _SkipEntry(Exception):
@@ -267,6 +273,92 @@ async def _liquidity_gate(symbol: str, want_long: bool, lots: int = 0) -> tuple[
 
 
 # --------------------------------------------------------------------------- #
+#  3-5-7 rule
+# --------------------------------------------------------------------------- #
+def session_start(now: datetime | None = None) -> datetime:
+    """Latest daily reset (session_reset_hour_ist, IST) at or before `now`."""
+    now = (now or datetime.now(IST)).astimezone(IST)
+    start = now.replace(hour=settings.session_reset_hour_ist, minute=0, second=0, microsecond=0)
+    return start if now >= start else start - timedelta(days=1)
+
+
+def _risk_capped_lots(lots: int, risk_per_lot: float, balance: float, open_risk: float,
+                      trade_risk_pct: float | None = None) -> int:
+    """Largest size ≤ lots keeping this trade ≤ trade_risk_pct (default 3%) and all open risk ≤ max_open_risk_pct."""
+    if risk_per_lot <= 0:
+        return lots
+    trade_pct = settings.max_trade_risk_pct if trade_risk_pct is None else trade_risk_pct
+    budget = min(balance * trade_pct / 100, balance * settings.max_open_risk_pct / 100 - open_risk)
+    return max(0, min(lots, int(budget // risk_per_lot)))
+
+
+async def _open_risk() -> float:
+    """$ at risk on open bot trades whose stop isn't at breakeven yet."""
+    # ponytail: uses the risk recorded at entry; positions opened outside the bot count as 0
+    held = {p["product_symbol"] for p in await _delta.get_positions() if p.get("size")}
+    return sum([float(s.get("risk_dollars") or 0)
+                async for s in db.bot_state.find({"be_moved": {"$ne": True}}, {"risk_dollars": 1})
+                if s["_id"] in held])
+
+
+async def _override_session() -> str | None:
+    if not _override["loaded"]:
+        try:
+            _override["session"] = ((await db.bot_meta.find_one({"_id": "rule_357"})) or {}).get("override_session")
+            _override["loaded"] = True
+        except Exception:
+            pass
+    return _override["session"]
+
+
+async def override_daily_target() -> None:
+    """Manual start: ignore this session's +7% stop until the next reset."""
+    _override.update(session=session_start().isoformat(), loaded=True)
+    try:
+        await db.bot_meta.update_one({"_id": "rule_357"}, {"$set": {"override_session": _override["session"]}},
+                                     upsert=True)
+    except Exception as e:
+        logger.warning(f"3-5-7 override not persisted ({type(e).__name__}) — holds until the next reload")
+
+
+async def _daily_target_hit() -> bool:
+    """Realized P/L since the session reset ≥ daily_profit_target_pct of the session's starting balance."""
+    if not settings.rule_357_enabled or settings.daily_profit_target_pct <= 0:
+        return False
+    from routers.trades import _build_view  # local import avoids a cycle
+    start = session_start()
+    realized = 0.0
+    for sym in set(settings.symbols()):
+        realized += sum(r["realized_pnl"] or 0 for r in (await _build_view(sym))["rows"]
+                        if r["status"] == "Closed" and r["exit_time"]
+                        and datetime.fromisoformat(r["exit_time"]) >= start)
+    balance = float((await _delta.get_wallet()).get("balance") or 0)
+    target = (balance - realized) * settings.daily_profit_target_pct / 100
+    _rule.update(session=start.isoformat(), realized=round(realized, 2), target=round(target, 2),
+                 hit=target > 0 and realized >= target)
+    return _rule["hit"] and await _override_session() != start.isoformat()
+
+
+async def daily_reset():
+    """Session reset (6PM IST): retrain the risk engine, clear the daily stop and start the bot."""
+    _rule["hit"] = False
+    try:
+        await risk_engine.retrain()
+    except Exception as e:
+        logger.error(f"risk engine retrain failed: {e}")
+    logger.info(f"3-5-7: new session at {session_start().isoformat()} — starting bot.")
+    start_bot()
+
+
+def schedule_daily_reset():
+    """Register the daily reset job (independent of the trading jobs, so it survives stop_bot)."""
+    scheduler.add_job(daily_reset, CronTrigger(hour=settings.session_reset_hour_ist, minute=0, timezone=IST),
+                      id="daily_reset", replace_existing=True)
+    if not scheduler.running:
+        scheduler.start()
+
+
+# --------------------------------------------------------------------------- #
 #  Closed-trade attribution
 # --------------------------------------------------------------------------- #
 def _parse_iso(v) -> datetime:
@@ -393,14 +485,74 @@ async def _attribute_closed_trade(symbol: str, state: dict) -> None:
     except Exception as e:
         logger.error(f"attribution error: {e}")
         return
+    try:
+        await risk_engine.record_path(_delta, symbol, state, _parse_iso(state.get("opened_at")), o["closed_at"],
+                                      await _fee_rate(symbol))
+    except Exception as e:
+        logger.error(f"{symbol} trade path not recorded: {e}")
     logger.info(f"{symbol} closed — strategy {o['strategy_pnl']:+.2f} ({o['strategy_r']:+.2f}R) "
                 f"| execution {o['execution_pnl']:+.2f} ({o['execution_r']:+.2f}R) "
                 f"| slippage {o['slippage_cost']:+.2f} → attributed to {o['side']} voters"
                 + (f" + agents {state['agents']}" if state.get("agents") else ""))
 
 
+async def _fee_rate(symbol: str) -> float:
+    """Delta taker fee rate; the configured fallback (logged) if the venue never told us."""
+    try:
+        rate = await _delta.get_taker_fee(symbol)
+    except Exception:
+        rate = None
+    if rate is None:
+        logger.warning(f"{symbol}: taker fee unknown — using fallback {settings.trail_fee_fallback_pct}%")
+        return settings.trail_fee_fallback_pct / 100
+    return rate
+
+
+async def _move_sl(symbol: str, pos: float, new_sl: float) -> bool:
+    """Place the new reduce-only stop first, then cancel the old ones, so the position is never unprotected."""
+    old = [o["id"] for o in await _delta.get_live_orders(symbol)
+           if o.get("reduce_only") and o.get("stop_order_type") == "stop_loss_order"]
+    try:
+        await _delta.place_stop_order(symbol, "buy" if pos < 0 else "sell", abs(int(round(pos))), new_sl,
+                                      "stop_loss_order")
+    except Exception as e:
+        logger.error(f"{symbol} SL move to {new_sl} failed: {e} — previous stop kept")
+        return False
+    pid = await _delta.get_product_id(symbol)
+    for oid in old:
+        try:
+            await _delta.cancel_order(oid, pid)
+        except Exception as e:  # both are reduce-only, so a leftover can't open a position
+            logger.error(f"{symbol} old SL {oid} not cancelled ({e}) — two stops resting until flat cleanup")
+    return True
+
+
+async def _trail_sl(symbol: str, state: dict, pos: float, tp1_filled: bool) -> None:
+    """Breakeven(+fees) at `trigger` of the way to TP1, then lock `lock` of TP1 profit once TP1 fills."""
+    stage = state.get("sl_stage", 1 if state.get("be_moved") else 0)
+    if stage >= 2:
+        return
+    mark = float((await _delta.get_ticker(symbol)).get("mark_price") or 0)  # raises on stale → skip this pass
+    if not mark:
+        return
+    long = state["side"] == "buy"
+    basis = float(state.get("fill_price") or state["entry"])
+    p = await risk_engine.params()
+    move = risk_engine.next_sl(long, basis, float(state["tps"][0]["price"]), state.get("sl"), stage, mark,
+                               tp1_filled, p["trigger"], p["lock"],
+                               risk_engine.fee_buffer(basis, await _fee_rate(symbol)))
+    if not move:
+        return
+    new_sl, new_stage, why = move
+    if await _move_sl(symbol, pos, new_sl):
+        await db.bot_state.update_one({"_id": symbol}, {"$set": {"sl": new_sl, "sl_stage": new_stage, "be_moved": True}})
+        prev = state.get("sl")
+        logger.info(f"{symbol} trail SL [{why}] {f'{prev:.1f}' if prev is not None else '—'} → {new_sl:.1f} "
+                    f"({'LONG' if long else 'SHORT'}, mark {mark:.1f}, basis {basis:.1f}, stage {stage}→{new_stage})")
+
+
 async def _manage_open_position(symbol: str):
-    """Attribute + clean up when flat; move SL to breakeven once a partial TP has filled."""
+    """Attribute + clean up when flat; otherwise trail the stop (or plain breakeven after TP1 if trailing is off)."""
     try:
         state = await db.bot_state.find_one({"_id": symbol})
         pos = await _delta.get_position_size(symbol)   # raises rather than report a false flat
@@ -411,14 +563,16 @@ async def _manage_open_position(symbol: str):
                 await db.bot_state.delete_one({"_id": symbol})
                 logger.info(f"{symbol} flat — cleared trade state and leftover orders.")
             return
-        if not state or state.get("be_moved") or abs(pos) >= state["size"] - 1e-9:
+        if not state:
             return
-        entry = state.get("fill_price") or state["entry"]   # true breakeven is the fill, not the mark
-        await _delta.cancel_reduce_only(symbol, "stop_loss_order")
-        await _delta.place_stop_order(symbol, "buy" if pos < 0 else "sell", abs(int(round(pos))), entry,
-                                      "stop_loss_order")
-        await db.bot_state.update_one({"_id": symbol}, {"$set": {"be_moved": True}})
-        logger.info(f"{symbol} TP1 hit — moved stop-loss to breakeven ({entry:.1f}).")
+        tp1_filled = abs(pos) < state["size"] - 1e-9
+        if settings.trail_enabled and state.get("tps"):
+            await _trail_sl(symbol, state, pos, tp1_filled)
+        elif tp1_filled and not state.get("be_moved"):
+            entry = state.get("fill_price") or state["entry"]   # true breakeven is the fill, not the mark
+            if await _move_sl(symbol, pos, entry):
+                await db.bot_state.update_one({"_id": symbol}, {"$set": {"be_moved": True}})
+                logger.info(f"{symbol} TP1 hit — moved stop-loss to breakeven ({entry:.1f}).")
     except Exception as e:
         logger.error(f"manage_position error: {e}")
 
@@ -730,6 +884,15 @@ async def _open_trade(symbol: str, a: dict, d: dict, votes_result: dict, weights
     margin = min(balance * cap_pct / 100.0, avail * settings.margin_cap_pct)
     lots = t["lots"] = max(int(margin * lev / (price * cv)) if price > 0 and cv > 0 else 0, 1)
     t["fraction"] = round(cap_pct, 2)
+    if settings.rule_357_enabled:
+        trade_pct = (await risk_engine.params())["trade_risk_pct"]
+        capped = _risk_capped_lots(lots, risk * cv, balance, await _open_risk(), trade_pct)
+        if capped < 1:
+            status = (f"skipped: 3-5-7 risk cap — 1 lot risks ${risk * cv:.2f} (max {trade_pct:g}% "
+                      f"per trade, {settings.max_open_risk_pct:g}% open)")
+            logger.info(f"{symbol} entry blocked — {status}")
+            raise _SkipEntry(status)
+        lots = t["lots"] = capped
     risk_dollars = risk * lots * cv
 
     strength = a["trend"]["st"]["latest"].get("strength", 0) if a["trend"]["st"] else 0
@@ -789,7 +952,7 @@ async def _open_trade(symbol: str, a: dict, d: dict, votes_result: dict, weights
 
     await db.bot_state.replace_one({"_id": symbol}, {
         "_id": symbol, "side": side, "size": lots, "entry": price, "fill_price": fill_price,
-        "sl": sl, "tps": placed_tps, "rr": rr, "be_moved": False,
+        "sl": sl, "sl0": sl, "sl_stage": 0, "tps": placed_tps, "rr": rr, "be_moved": False,
         "votes": votes_result["votes"], "agents": d["agent_ids"],
         "shadow_votes": votes_result.get("shadow_votes") or {},
         "risk_dollars": round(risk_dollars, 4), "sl_method": sl_method, "tp_source": tp_source, "ai": d["ai_meta"],
@@ -917,6 +1080,14 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
 # --------------------------------------------------------------------------- #
 async def bot_tick():
     """Deep pass over trade symbols (may enter) plus any symbol with a position or saved state (managed only)."""
+    try:
+        if await _daily_target_hit():
+            logger.warning(f"3-5-7: daily target hit (+${_rule['realized']} ≥ ${_rule['target']}) — "
+                           f"bot stopped until {settings.session_reset_hour_ist}:00 IST or a manual Start.")
+            stop_bot("daily +7% target hit")
+            return
+    except Exception as e:  # fail open, like the daily loss limit
+        logger.error(f"3-5-7 target check failed: {e}")
     trade_syms = settings.symbols()
     tracked = set(trade_syms)
     try:
@@ -973,7 +1144,7 @@ async def fast_tick():
 
 
 def start_bot():
-    global _bot_running
+    global _bot_running, _stop_reason
     if _bot_running:
         return {"status": "already_running"}
     secs = settings.check_interval_seconds
@@ -986,14 +1157,14 @@ def start_bot():
                           id="fast_tick", **common)
     if not scheduler.running:
         scheduler.start()
-    _bot_running = True
+    _bot_running, _stop_reason = True, None
     cadence = f"{secs} seconds" if secs > 0 else f"{settings.check_interval_minutes} minutes"
     logger.info(f"Bot started — checking every {cadence}.")
     return {"status": "started"}
 
 
-def stop_bot():
-    global _bot_running
+def stop_bot(reason: str = "manual"):
+    global _bot_running, _stop_reason
     if not _bot_running:
         return {"status": "not_running"}
     for job_id in ("bot_tick", "fast_tick"):
@@ -1002,8 +1173,8 @@ def stop_bot():
         except Exception:
             pass
     _watch.clear()  # an armed watch must never survive a stop
-    _bot_running = False
-    logger.info("Bot stopped.")
+    _bot_running, _stop_reason = False, reason
+    logger.info(f"Bot stopped ({reason}).")
     return {"status": "stopped"}
 
 
@@ -1018,4 +1189,8 @@ def bot_status() -> dict:
         "symbol": settings.trading_symbol,
         "symbols": settings.symbols(),
         "next_run": str(job.next_run_time) if job else None,
+        "stop_reason": _stop_reason,
+        "rule_357": {**_rule, "overridden": _override["session"] == _rule["session"],
+                     "next_reset": str(scheduler.get_job("daily_reset").next_run_time)
+                     if scheduler.get_job("daily_reset") else None},
     }

@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from bot.scheduler import start_bot
+from bot.scheduler import schedule_daily_reset, start_bot
 from config import settings
 from db import db
 from routers import bot, trades, market, news
@@ -23,6 +23,7 @@ async def lifespan(app: FastAPI):
         await db.funding_history.create_index([("symbol", 1), ("ts", -1)])  # queried every deep tick
     except Exception as e:
         logger.error(f"Mongo index creation skipped (DB unreachable): {e}")
+    schedule_daily_reset()  # 6PM IST session reset + auto-start, even if the bot is stopped
     if settings.auto_start_bot:
         try:
             start_bot()

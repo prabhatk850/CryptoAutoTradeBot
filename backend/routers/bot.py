@@ -4,10 +4,10 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
-from bot.scheduler import start_bot, stop_bot, bot_status
+from bot.scheduler import start_bot, stop_bot, bot_status, override_daily_target
 from bot.delta_client import DeltaClient
 from bot.backtest import run_backtest
-from bot import strategies, autotune, ensemble
+from bot import strategies, autotune, ensemble, risk_engine
 from config import settings
 from db import db
 
@@ -17,6 +17,8 @@ _delta = DeltaClient()
 
 @router.post("/start")
 async def start():
+    """Manual start — also overrides today's 3-5-7 profit stop."""
+    await override_daily_target()
     return start_bot()
 
 
@@ -128,8 +130,8 @@ async def training(days: int = 30, limit: int = 60):
         except Exception:
             return {}
 
-    perf, outcomes, skips, unverified, liq_shadow = await asyncio.gather(
-        autotune.status(), _outcomes(), _skips(), _unverified(), _liquidity_shadow())
+    perf, outcomes, skips, unverified, liq_shadow, engine = await asyncio.gather(
+        autotune.status(), _outcomes(), _skips(), _unverified(), _liquidity_shadow(), risk_engine.status())
 
     for o in outcomes:
         o["_id"] = str(o.get("_id", ""))
@@ -173,12 +175,22 @@ async def training(days: int = 30, limit: int = 60):
         },
         "strategies": perf["strategies"],
         "liquidity_gate": liq_shadow,
+        "risk_engine": engine,
         "recent_trades": outcomes,
         "skipped": [{"reason": k, "count": v} for k, v in
                     sorted(skips.items(), key=lambda kv: -kv[1])],
         "skipped_total": sum(skips.values()),
         "window_days": days,
     }
+
+
+@router.post("/risk-engine/train")
+async def train_risk_engine():
+    """Retrain trail/risk params now (also runs at every 6PM IST reset)."""
+    doc = await risk_engine.retrain()
+    if hasattr(doc.get("trained_at"), "isoformat"):
+        doc["trained_at"] = doc["trained_at"].isoformat()
+    return doc
 
 
 @router.get("/strategies")
