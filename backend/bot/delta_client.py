@@ -73,6 +73,7 @@ class DeltaClient:
         self._meta: dict[tuple[str, str], object] = {}        # (symbol, field) -> static product fact
         self._rcache: dict[str, tuple[float, object]] = {}    # short-TTL read cache
         self._rlocks: dict[str, asyncio.Lock] = {}            # one in-flight fetch per key
+        self._client: httpx.AsyncClient | None = None
 
     async def _cached(self, key: str, ttl: float, factory):
         """Shared short-TTL read; concurrent callers wait on one fetch."""
@@ -91,11 +92,23 @@ class DeltaClient:
         """Drop cached reads (after placing/cancelling orders)."""
         self._rcache.clear()
 
+    async def _send(self, method: str, url: str, **kw) -> httpx.Response:
+        """Request on one shared keep-alive pool; a GET whose connection fails is retried once (orders never are)."""
+        # A fresh TLS handshake per call turned packet loss into ConnectTimeouts.
+        # ponytail: the pool binds to the first event loop that uses it; one loop per process here
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(headers=_UA)
+        try:
+            return await self._client.request(method, url, **kw)
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError):
+            if method != "GET":
+                raise
+            return await self._client.request(method, url, **kw)
+
     async def _public(self, path: str, params: dict | None = None, timeout: float = 10):
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.get(f"{self.base_url}{path}", params=params, headers=_UA)
-            resp.raise_for_status()
-            return resp.json().get("result")
+        resp = await self._send("GET", f"{self.base_url}{path}", params=params, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json().get("result")
 
     async def _signed(self, method: str, path: str, query: str = "", body: dict | None = None,
                       timeout: float = 10):
@@ -106,9 +119,8 @@ class DeltaClient:
                        hashlib.sha256).hexdigest()
         headers = {"api-key": settings.delta_api_key, "timestamp": ts, "signature": sig,
                    "Content-Type": "application/json", **_UA}
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.request(method, f"{self.base_url}{path}{query}", content=payload or None,
-                                        headers=headers)
+        resp = await self._send(method, f"{self.base_url}{path}{query}", content=payload or None,
+                                headers=headers, timeout=timeout)
         if method != "GET":
             self.invalidate_cache()  # positions/orders changed (even if the call failed)
         resp.raise_for_status()

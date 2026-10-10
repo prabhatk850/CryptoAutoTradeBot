@@ -370,6 +370,7 @@ export default function TradingViewChart({
     if (data.length === 0) return;
 
     series.setData(data);
+    liveBarRef.current = null;  // fresh history: re-seed the live bar from it, never carry an old high/low over
     if (needsFitRef.current) {
       chart.timeScale().fitContent();
       needsFitRef.current = false;

@@ -125,7 +125,8 @@ export default function Dashboard() {
   }, [chartSymbol]);
 
   // Mark, not `close`: the testnet's last-traded price sits at stale levels and everything else is mark-based.
-  const price = Number(ticker?.mark_price ?? ticker?.close ?? 0);
+  // Ignore a ticker for another symbol (a late BTC reply after switching to ETH drew an 83k spike).
+  const price = ticker?.symbol === chartSymbol ? Number(ticker?.mark_price ?? ticker?.close ?? 0) : 0;
 
   return (
     <div className="min-h-screen bg-[#0d1117] text-white">
